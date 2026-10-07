@@ -49,3 +49,46 @@ test('cleanup failure prevents deletion of the Codex thread', async () => {
   await assert.rejects(client.deleteThread('thread-1'), /Cleanup unsupported/);
   assert.equal(rpc.calls.some(call => call.method === 'thread/delete'), false);
 });
+
+for (const dynamic of [false, true]) {
+  test(`answers ${dynamic ? 'dynamic ask_user' : 'native user input'} questions and resumes the same turn`, async () => {
+    const rpc = new FakeRpc();
+    const sent = [];
+    rpc.send = message => {
+      sent.push(message);
+      queueMicrotask(() => rpc.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } }));
+    };
+    const questions = [{ id: 'storage', header: 'Storage', question: 'How should todos be saved?', options: [{ label: 'Browser', description: 'Use local storage' }, { label: 'Backend', description: 'Use a server' }] }];
+    const baseRequest = rpc.request.bind(rpc);
+    rpc.request = async (method, params) => {
+      if (method === 'turn/start') {
+        rpc.calls.push({ method, params });
+        queueMicrotask(() => rpc.emit('serverRequest', {
+          id: 77,
+          method: dynamic ? 'item/tool/call' : 'item/tool/requestUserInput',
+          params: { threadId: 'thread-1', turnId: 'turn-1', ...(dynamic ? { tool: 'ask_user', arguments: { questions } } : { questions }) },
+        }));
+        return { turn: { id: 'turn-1' } };
+      }
+      return baseRequest(method, params);
+    };
+    const client = createClient(rpc, { cwd: '/workspace' });
+    const { events } = await client.start('/another/folder').runStreamed('Build a todo app');
+    let requestId;
+    for await (const event of events) {
+      if (event.type !== 'questions') continue;
+      requestId = event.request.requestId;
+      assert.deepEqual(event.request.questions, questions);
+      assert.throws(() => client.answerQuestion('other-thread', requestId, {}), /no longer/);
+      assert.throws(() => client.answerQuestion('thread-1', requestId, {}), /every question/);
+      client.answerQuestion('thread-1', requestId, { storage: { answers: ['Backend'] } });
+    }
+    assert.equal(rpc.calls[0].params.cwd, '/another/folder');
+    assert.equal(rpc.calls[0].params.dynamicTools[0].name, 'ask_user');
+    assert.equal(sent[0].id, 77);
+    const result = dynamic ? JSON.parse(sent[0].result.contentItems[0].text) : sent[0].result;
+    assert.deepEqual(result, { answers: { storage: { answers: ['Backend'] } } });
+    assert.throws(() => client.answerQuestion('thread-1', requestId, {}), /no longer/);
+    assert.equal(rpc.listenerCount('serverRequest'), 0);
+  });
+}

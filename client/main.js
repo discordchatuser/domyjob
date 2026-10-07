@@ -1,3 +1,5 @@
+import { activityFromMessage, outputPreview } from './activity.js';
+import { questionCard } from './questions.js';
 import './style.css';
 const $ = selector => document.querySelector(selector);
 let chats = [], selected = null, status = {}, inFlight = new Set();
@@ -7,7 +9,7 @@ function saveDraft() {
   if (selected) drafts.set(selected, { text: $('#prompt').value, commands: [...commands], commandMode });
 }
 function composer() {
-  $('form').classList.toggle('command-mode', commandMode);
+  $('#composer').classList.toggle('command-mode', commandMode);
   $('#prompt').placeholder = commandMode ? 'npm run dev' : 'Ask Codex anything…';
   $('#mode').textContent = commandMode ? 'Command · Esc to add' : 'Cmd+. to add a command';
   $('#commands').replaceChildren(...commands.map((command, index) => {
@@ -23,6 +25,8 @@ function finishCommand() {
   commandMode = false; composer();
 }
 const streams = new Map();
+const expanded = new Set();
+let lastRenderedThread;
 async function api(path, options) {
   const response = await fetch('/api' + path, options);
   if (!response.ok) throw new Error((await response.json()).error || 'Request failed');
@@ -59,35 +63,67 @@ function render() {
     row.append(button, remove); return row;
   }));
   const messages = $('#messages');
+  const follow = lastRenderedThread !== selected || messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+  const scrollTop = messages.scrollTop;
+  const focused = messages.contains(document.activeElement) ? document.activeElement.id : null;
   messages.replaceChildren();
   const items = [...(chat?.messages || [])];
-  for (const text of streams.get(selected)?.values() || []) items.push({ role: 'assistant', text });
+  for (const item of streams.get(selected)?.values() || []) items.push(item);
   if (!items.length) {
     const empty = document.createElement('div'); empty.className = 'empty';
-    const heading = document.createElement('h1'); heading.textContent = 'What are we working on?';
+    const heading = document.createElement('h1'); heading.textContent = '› What are we working on?';
     const text = document.createElement('p'); text.textContent = 'Start a thread and send a prompt to your local Codex.';
     empty.append(heading, text); messages.append(empty);
   }
   for (const item of items) {
-    const article = document.createElement('article'); article.className = item.role;
-    const label = document.createElement('span'); label.className = 'label'; label.textContent = { user: 'You', assistant: 'Codex', error: 'Error' }[item.role];
+    const activity = activityFromMessage(item);
+    if (activity) {
+      const key = selected + ':' + (activity.id || items.indexOf(item));
+      const details = document.createElement('details'); details.className = 'activity'; details.open = expanded.has(key);
+      details.ontoggle = () => { if (!details.isConnected) return; if (details.open) expanded.add(key); else expanded.delete(key); };
+      const summary = document.createElement('summary');
+      const command = document.createElement('span'); command.className = 'activity-command'; command.textContent = activity.command || activity.label;
+      command.title = command.textContent;
+      const meta = document.createElement('span'); meta.className = 'activity-status';
+      const failed = activity.exitCode != null && activity.exitCode !== 0 || activity.status === 'failed';
+      if (failed) details.classList.add('failed');
+      meta.textContent = failed ? 'exit ' + (activity.exitCode ?? 'failed') : activity.status === 'inProgress' || activity.status === 'running' ? 'running' : activity.exitCode != null ? 'exit ' + activity.exitCode : activity.status || 'done';
+      if (activity.durationMs != null) meta.textContent += ' · ' + (activity.durationMs / 1000).toFixed(1) + 's';
+      summary.append(command, meta); details.append(summary);
+      const output = document.createElement('pre'); output.className = 'activity-output'; output.textContent = activity.output || '(no output)'; details.append(output);
+      messages.append(details);
+      const preview = outputPreview(activity.output);
+      if (preview.text) { const text = document.createElement('pre'); text.className = 'activity-preview'; text.textContent = preview.text + (preview.more ? '\n… expand to see full output' : ''); messages.append(text); }
+      continue;
+    }
+    const article = document.createElement('article'); article.className = item.role + (item.phase === 'commentary' ? ' commentary' : '');
+    const label = document.createElement('span'); label.className = 'label'; label.textContent = { user: '›', assistant: '•', error: '!' }[item.role];
     const text = document.createElement('div'); text.className = 'text'; text.textContent = item.text;
     for (const command of item.commands || []) { const code = document.createElement('pre'); code.className = 'command-chip'; code.textContent = '$ ' + command; text.append(code); }
     article.append(label, text); messages.append(article);
   }
-  if (inFlight.has(selected)) { const waiting = document.createElement('div'); waiting.className = 'waiting'; waiting.textContent = 'Codex is working…'; messages.append(waiting); }
-  messages.scrollTop = messages.scrollHeight;
-  $('#send').disabled = !status.ready || inFlight.has(selected);
+  for (const request of chat?.pendingQuestions || []) {
+    messages.append(questionCard(request, async answers => {
+      await api(`/chats/${chat.id}/questions/${request.requestId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answers }) });
+      chat.pendingQuestions = (chat.pendingQuestions || []).filter(item => item.requestId !== request.requestId); render();
+    }));
+  }
+  if (inFlight.has(selected) && !chat?.pendingQuestions?.length) { const waiting = document.createElement('div'); waiting.className = 'waiting'; waiting.textContent = 'Codex is working…'; messages.append(waiting); }
+  messages.scrollTop = follow ? messages.scrollHeight : scrollTop;
+  lastRenderedThread = selected;
+  if (focused) document.getElementById(focused)?.focus({ preventScroll: true });
+  $('#send').disabled = !status.ready || inFlight.has(selected) || chat?.busy;
+  $('#title').title = chat?.cwd || 'Default working directory';
 }
 async function newChat() {
-  const chat = await api('/chats', { method: 'POST' });
+  const chat = await api('/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: $('#workspace').value.trim() }) });
   saveDraft();
   chats.unshift(chat); selected = chat.id; $('#prompt').value = ''; commands = []; commandMode = false; composer(); render(); return chat;
 }
 $('#new').onclick = () => newChat().catch(e => error(e.message));
-$('form').onsubmit = async event => {
+$('#composer').onsubmit = async event => {
   event.preventDefault();
-  if (!status.ready || inFlight.has(selected)) return;
+  if (!status.ready || inFlight.has(selected) || chats.find(chat => chat.id === selected)?.busy) return;
   if (commandMode) finishCommand();
   const prompt = $('#prompt').value.trim();
   const submittedCommands = [...commands];
@@ -106,8 +142,12 @@ $('form').onsubmit = async event => {
       const event = JSON.parse(line);
       if (!chats.some(chat => chat.id === id)) return;
       if (event.type === 'chat' || event.type === 'done') chats = chats.map(chat => chat.id === id ? event.chat : chat);
-      if (event.type === 'command') streams.get(id).set('command:' + event.id, '$ ' + event.command + '\n' + (event.output || 'Running…') + (event.exitCode == null ? '' : '\nExit code: ' + event.exitCode));
-      if (event.type === 'message') streams.get(id).set(event.id, event.text);
+      const current = chats.find(chat => chat.id === id);
+      if (event.type === 'questions') current.pendingQuestions = [...(current.pendingQuestions || []), event.request];
+      if (event.type === 'questions.resolved') current.pendingQuestions = (current.pendingQuestions || []).filter(item => item.requestId !== event.requestId);
+      if (event.type === 'command') streams.get(id).set('command:' + event.id, { role: 'tool', ...event, status: event.status || (event.exitCode == null ? 'running' : 'completed') });
+      if (event.type === 'activity') streams.get(id).set('activity:' + event.item.id, { role: 'activity', ...event.item });
+      if (event.type === 'message') streams.get(id).set(event.id, { role: 'assistant', text: event.text, phase: event.phase });
       if (event.type === 'error' && selected === id) error(event.error);
       if (event.type === 'done') { doneReceived = true; streams.delete(id); }
       render();
@@ -137,7 +177,7 @@ document.addEventListener('keydown', event => {
 });
 composer();
 $('#prompt').onkeydown = event => {
-  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); $('form').requestSubmit(); }
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); $('#composer').requestSubmit(); }
 };
 try {
   [status, chats] = await Promise.all([api('/status'), api('/chats')]);
@@ -147,3 +187,15 @@ try {
   if (!status.ready) error(status.error);
   render();
 } catch (e) { error(e.message); }
+// A reloaded page can observe a turn still running on the backend.
+let refreshing = false;
+setInterval(async () => {
+  if (refreshing || !chats.some(chat => chat.busy && !inFlight.has(chat.id))) return;
+  refreshing = true;
+  try {
+    const latest = await api('/chats');
+    chats = chats.map(chat => inFlight.has(chat.id) ? chat : latest.find(item => item.id === chat.id) || chat);
+    render();
+  } catch (e) { error(e.message); }
+  finally { refreshing = false; }
+}, 2000);

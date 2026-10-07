@@ -4,8 +4,10 @@ A minimal local chat UI for Codex, with a Node backend and Vite frontend. The ba
 
 ## Features
 
+- **Interactive choices:** Codex can pause to ask questions. Pick an option (click or use arrow keys), switch your choice, or type your own answer, then click **Send answers** to continue the same turn.
+- **Working directory:** choose an existing folder for each new thread. To build beside this project, select its parent folder and ask Codex to create a new subfolder.
 - **Multiple threads:** create conversations and switch between them in the sidebar. History is saved locally across restarts.
-- **Streaming replies:** see Codex responses and command output as they arrive.
+- **Terminal-style transcript:** dark monospace layout with streamed replies, compact tool activity, exit statuses, and collapsible command output. Older command history uses the same compact display.
 - **Command shortcut:** press Cmd+. (Ctrl+. on other keyboards), type a command, and press Escape to attach it. Enter sends it. You can also ask “run ls -la and give me the output”.
 - **Thread deletion:** × interrupts the active turn, cleans tracked background terminals, and deletes the Codex thread and chat history. Cleanup failures keep the chat available for retry. Independently detached processes aren't covered.
 - **Automatic model:** follows your local Codex configuration. Commands can write inside the working directory; approval requests aren't supported.

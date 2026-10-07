@@ -14,8 +14,8 @@ export class CodexRpc extends EventEmitter {
       let message;
       try { message = JSON.parse(line); } catch { return; }
       if (message.method && message.id != null) {
-        // No interactive approval/input UI: reject server requests rather than hang.
-        this.send({ id: message.id, error: { code: -32601, message: 'Interactive requests are unsupported by this client' } });
+        if (['item/tool/requestUserInput', 'tool/requestUserInput', 'item/tool/call'].includes(message.method)) this.emit('serverRequest', message);
+        else this.send({ id: message.id, error: { code: -32601, message: 'This interactive request is unsupported by this client' } });
       } else if (message.id != null) {
         const pending = this.pending.get(message.id);
         if (!pending) return;

@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { readFile, mkdir, rename, writeFile } from 'node:fs/promises';
+import { readFile, mkdir, rename, writeFile, stat } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 
 export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' }) {
@@ -11,6 +11,12 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
   catch (error) { if (error.code !== 'ENOENT') throw error; chats = []; }
   const running = new Map();
   const deleting = new Set();
+  const questions = new Map();
+  async function readJson(req) {
+    let body = '';
+    for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 65536) throw new Error('Request is too large'); }
+    return body ? JSON.parse(body) : {};
+  }
   let saves = Promise.resolve();
   function save() {
     const snapshot = JSON.stringify(chats, null, 2);
@@ -20,7 +26,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
     });
     return saves;
   }
-  const summary = chat => ({ ...chat, busy: running.has(chat.id) });
+  const summary = chat => ({ ...chat, busy: running.has(chat.id), pendingQuestions: questions.get(chat.id) || [] });
   return createServer(async (req, res) => {
     const json = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     try {
@@ -35,7 +41,12 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
       }
       if (req.method === 'GET' && pathname === '/api/chats') return json(200, chats.map(summary));
       if (req.method === 'POST' && pathname === '/api/chats') {
-        const chat = { id: randomUUID(), threadId: null, title: 'New thread', messages: [] };
+        let input;
+        try { input = await readJson(req); } catch { return json(400, { error: 'Invalid request' }); }
+        if (input.cwd !== undefined && typeof input.cwd !== 'string') return json(400, { error: 'Invalid working directory' });
+        const cwd = input.cwd?.trim() ? resolve(input.cwd.trim()) : undefined;
+        if (cwd) { try { if (!(await stat(cwd)).isDirectory()) throw new Error(); } catch { return json(400, { error: 'Working directory must be an existing folder' }); } }
+        const chat = { id: randomUUID(), threadId: null, title: 'New thread', messages: [], ...(cwd ? { cwd } : {}) };
         chats.unshift(chat); await save(); return json(201, summary(chat));
       }
       const deletion = pathname.match(/^\/api\/chats\/([^/]+)$/);
@@ -54,6 +65,23 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           chats = chats.filter(item => item.id !== chat.id); await save();
           return json(200, { deleted: true });
         } finally { deleting.delete(chat.id); }
+      }
+      const answer = pathname.match(/^\/api\/chats\/([^/]+)\/questions\/([^/]+)$/);
+      if (req.method === 'POST' && answer) {
+        const chat = chats.find(chat => chat.id === answer[1]);
+        if (!chat) return json(404, { error: 'Thread not found' });
+        if (!running.has(chat.id) || deleting.has(chat.id)) return json(409, { error: 'Thread is not waiting for an answer' });
+        const request = (questions.get(chat.id) || []).find(item => item.requestId === answer[2]);
+        if (!request) return json(409, { error: 'Question is no longer active' });
+        let input;
+        try {
+          input = await readJson(req);
+          (await getCodex()).answerQuestion(chat.threadId, request.requestId, input.answers);
+        } catch (error) { return json(400, { error: error.message }); }
+        chat.messages.push({ role: 'user', text: request.questions.map(q => q.question + '\n' + (q.isSecret ? '[Private answer]' : input.answers[q.id].answers.join(', '))).join('\n\n') });
+        questions.set(chat.id, (questions.get(chat.id) || []).filter(item => item.requestId !== request.requestId));
+        running.get(chat.id)?.send?.({ type: 'questions.resolved', requestId: request.requestId });
+        await save(); return json(200, { answered: true });
       }
       const match = pathname.match(/^\/api\/chats\/([^/]+)\/messages$/);
       if (req.method === 'POST' && match) {
@@ -80,25 +108,38 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
             ? 'Run these shell commands in the working directory and report their output and exit status. For a long-running server, report startup output and return rather than waiting indefinitely.\n' + commands.map(command => JSON.stringify(command)).join('\n') + (input.prompt.trim() ? '\n\nUser request:\n' + input.prompt.trim() : '')
             : input.prompt.trim();
           const codex = await getCodex();
-          const thread = chat.threadId ? codex.resume(chat.threadId) : codex.start();
+          const thread = chat.threadId ? codex.resume(chat.threadId, chat.cwd) : codex.start(chat.cwd);
           chat.messages.push({ role: 'user', text: input.prompt.trim(), ...(commands.length ? { commands } : {}) });
           if (chat.title === 'New thread') chat.title = (input.prompt.trim() || commands[0]).slice(0, 48);
           await save();
           res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-cache' });
           const send = event => { if (!res.destroyed) res.write(JSON.stringify(event) + '\n'); };
+          controller.send = send;
           res.on('close', () => { if (!res.writableEnded) controller.abort(); });
           if (controller.signal.aborted) { res.end(); return; }
           send({ type: 'chat', chat: summary(chat) });
           try {
             const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal });
             for await (const event of events) {
-              if (event.type === 'thread.started') { chat.threadId = event.thread_id; await save(); }
-              if (['item.started', 'item.updated', 'item.completed'].includes(event.type) && event.item.type === 'agent_message') send({ type: 'message', id: event.item.id, text: event.item.text });
-              if (['item.started', 'item.updated', 'item.completed'].includes(event.type) && event.item.type === 'command_execution') {
-                send({ type: 'command', id: event.item.id, command: event.item.command, output: event.item.aggregated_output, exitCode: event.item.exit_code });
-                if (event.type === 'item.completed') chat.messages.push({ role: 'assistant', text: '$ ' + event.item.command + '\n' + (event.item.aggregated_output || '') + (event.item.exit_code == null ? '' : '\nExit code: ' + event.item.exit_code) });
+              if (event.type === 'questions') {
+                questions.set(chat.id, [...(questions.get(chat.id) || []), event.request]);
+                send(event);
               }
-              if (event.type === 'item.completed' && event.item.type === 'agent_message') chat.messages.push({ role: 'assistant', text: event.item.text });
+              if (event.type === 'questions.resolved') {
+                questions.set(chat.id, (questions.get(chat.id) || []).filter(item => item.requestId !== event.requestId));
+                send(event);
+              }
+              if (event.type === 'thread.started') { chat.threadId = event.thread_id; await save(); }
+              if (['item.started', 'item.updated', 'item.completed'].includes(event.type) && event.item.type === 'agent_message') send({ type: 'message', id: event.item.id, text: event.item.text, phase: event.item.phase });
+              if (['item.started', 'item.updated', 'item.completed'].includes(event.type) && event.item.type === 'command_execution') {
+                send({ type: 'command', id: event.item.id, command: event.item.command, output: event.item.aggregated_output, exitCode: event.item.exit_code, status: event.item.status, durationMs: event.item.duration_ms });
+                if (event.type === 'item.completed') chat.messages.push({ role: 'tool', id: event.item.id, command: event.item.command, output: event.item.aggregated_output || '', exitCode: event.item.exit_code, status: event.item.status || 'completed', durationMs: event.item.duration_ms });
+              }
+              if (['item.started', 'item.updated', 'item.completed'].includes(event.type) && event.item.type === 'activity') {
+                send({ type: 'activity', item: event.item });
+                if (event.type === 'item.completed') chat.messages.push({ ...event.item, role: 'activity' });
+              }
+              if (event.type === 'item.completed' && event.item.type === 'agent_message') chat.messages.push({ role: 'assistant', text: event.item.text, phase: event.item.phase });
               if (event.type === 'turn.failed') throw new Error(event.error.message);
               if (event.type === 'error') throw new Error(event.message);
             }
@@ -106,9 +147,10 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
             chat.messages.push({ role: 'error', text: error.message });
             send({ type: 'error', error: error.message });
           }
+          questions.delete(chat.id);
           await save(); running.delete(chat.id);
           send({ type: 'done', chat: summary(chat) }); res.end();
-        } finally { running.delete(chat.id); settle(); }
+        } finally { questions.delete(chat.id); running.delete(chat.id); settle(); }
         return;
       }
       if (pathname.startsWith('/api/')) return json(404, { error: 'Not found' });
