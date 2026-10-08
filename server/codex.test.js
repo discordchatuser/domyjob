@@ -92,3 +92,26 @@ for (const dynamic of [false, true]) {
     assert.equal(rpc.listenerCount('serverRequest'), 0);
   });
 }
+
+test('adapts generated, viewed and MCP images', async () => {
+  const rpc = new FakeRpc();
+  const original = rpc.request.bind(rpc);
+  rpc.request = async (method, params) => {
+    if (method !== 'turn/start') return original(method, params);
+    queueMicrotask(() => {
+      for (const item of [
+        { type: 'imageGeneration', id: 'generated', result: 'base64-image', savedPath: null, status: 'completed' },
+        { type: 'imageView', id: 'viewed', path: '/tmp/image.png' },
+        { type: 'mcpToolCall', id: 'mcp', tool: 'draw', result: { content: [{ type: 'image', data: 'mcp-base64' }] } },
+      ]) rpc.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', item } });
+      rpc.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { status: 'completed' } } });
+    });
+    return { turn: { id: 'turn-1' } };
+  };
+  const client = createClient(rpc);
+  const { events } = await client.start().runStreamed('Create an image');
+  const seen = []; for await (const event of events) if (event.item) seen.push(event.item);
+  assert.equal(seen[0].base64, 'base64-image');
+  assert.equal(seen[1].source, '/tmp/image.png');
+  assert.equal(seen[2].references[0].base64, 'mcp-base64');
+});

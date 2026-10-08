@@ -1,6 +1,7 @@
 import { activityFromMessage, outputPreview } from './activity.js';
 import { questionCard } from './questions.js';
 import './style.css';
+import { openGallery, syncGallery, imagePreview } from './gallery.js';
 import { createVoice } from './voice.js';
 const $ = selector => document.querySelector(selector);
 let chats = [], selected = null, status = {}, inFlight = new Set();
@@ -37,6 +38,9 @@ async function api(path, options) {
 function error(message = '') { $('#error').textContent = message; }
 function render() {
   const chat = chats.find(chat => chat.id === selected);
+  syncGallery(chat);
+  $('#gallery').hidden = !chat?.images?.length;
+  $('#gallery').textContent = `Images (${chat?.images?.length || 0})`;
   $('#title').textContent = chat?.title || 'New conversation';
   $('#threads').replaceChildren(...chats.map(chat => {
     const button = document.createElement('button');
@@ -104,6 +108,8 @@ function render() {
     const label = document.createElement('span'); label.className = 'label'; label.textContent = { user: '›', assistant: '•', error: '!' }[item.role];
     const text = document.createElement('div'); text.className = 'text'; text.textContent = item.text;
     for (const command of item.commands || []) { const code = document.createElement('pre'); code.className = 'command-chip'; code.textContent = '$ ' + command; text.append(code); }
+    for (const image of item.images || []) text.append(imagePreview(image, chat));
+    for (const message of item.imageErrors || []) { const failure = document.createElement('p'); failure.className = 'image-error'; failure.textContent = message; text.append(failure); }
     article.append(label, text);
     messages.append(article);
   }
@@ -126,6 +132,7 @@ async function newChat() {
   saveDraft();
   chats.unshift(chat); selected = chat.id; $('#prompt').value = ''; commands = []; commandMode = false; composer(); render(); return chat;
 }
+$('#gallery').onclick = () => openGallery(chats.find(chat => chat.id === selected));
 $('#new').onclick = () => newChat().catch(e => error(e.message));
 $('#composer').onsubmit = async event => {
   event.preventDefault();
@@ -154,6 +161,11 @@ $('#composer').onsubmit = async event => {
       if (event.type === 'questions.resolved') current.pendingQuestions = (current.pendingQuestions || []).filter(item => item.requestId !== event.requestId);
       if (event.type === 'command') streams.get(id).set('command:' + event.id, { role: 'tool', ...event, status: event.status || (event.exitCode == null ? 'running' : 'completed') });
       if (event.type === 'activity') streams.get(id).set('activity:' + event.item.id, { role: 'activity', ...event.item });
+      if (event.type === 'image') {
+        current.images ||= [];
+        if (!current.images.some(image => image.id === event.image.id)) current.images.push(event.image);
+        streams.get(id).set('image:' + event.image.id, { role: 'assistant', text: '', images: [event.image] });
+      }
       if (event.type === 'message') streams.get(id).set(event.id, { role: 'assistant', text: event.text, phase: event.phase });
       if (event.type === 'error' && selected === id) error(event.error);
       if (event.type === 'done') { doneReceived = true; streams.delete(id); }

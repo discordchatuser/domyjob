@@ -39,9 +39,15 @@ export function createClient(rpc, { binary, cwd, model } = {}) {
           rpc.request('turn/interrupt', { threadId, turnId }).catch(fail);
         };
         const convert = item => {
+          if (item.type === 'imageView') return { id: item.id, type: 'image', source: item.path };
+          if (item.type === 'imageGeneration') return { id: item.id, type: 'image', source: item.savedPath || '', base64: item.savedPath ? undefined : item.result, name: 'Generated image', prompt: item.revisedPrompt || undefined };
           if (item.type === 'agentMessage') return { id: item.id, type: 'agent_message', text: item.text || '', phase: item.phase };
           if (item.type === 'fileChange') return { id: item.id, type: 'activity', label: 'Edited ' + (item.changes || []).map(change => change.path).join(', '), output: (item.changes || []).map(change => change.diff || '').join('\n'), status: item.status };
-          if (item.type === 'mcpToolCall') return { id: item.id, type: 'activity', label: 'Called ' + item.server + '/' + item.tool, output: item.error?.message || '', status: item.status };
+          if (item.type === 'mcpToolCall') {
+            const references = (item.result?.content || []).filter(content => content.type === 'image' && typeof content.data === 'string').map(content => ({ source: '', base64: content.data, name: item.tool + ' image' }));
+            if (references.length) return { id: item.id, type: 'image', references };
+            return { id: item.id, type: 'activity', label: 'Called ' + item.server + '/' + item.tool, output: item.error?.message || '', status: item.status };
+          }
           if (item.type === 'commandExecution') return { id: item.id, type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput || '', exit_code: item.exitCode, status: item.status, duration_ms: item.durationMs };
         };
         const requestInput = request => {

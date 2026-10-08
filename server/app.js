@@ -1,10 +1,12 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { readFile, mkdir, rename, writeFile, stat } from 'node:fs/promises';
+import { imageStore, imageReferences } from './images.js';
 import { resolve, extname } from 'node:path';
 
 export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' }) {
   await mkdir(dataDir, { recursive: true });
+  const images = imageStore(dataDir);
   const file = resolve(dataDir, 'chats.json');
   let chats;
   try { chats = JSON.parse(await readFile(file, 'utf8')); }
@@ -49,6 +51,16 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
         const chat = { id: randomUUID(), threadId: null, title: 'New thread', messages: [], ...(cwd ? { cwd } : {}) };
         chats.unshift(chat); await save(); return json(201, summary(chat));
       }
+      const imageRoute = pathname.match(/^\/api\/chats\/([^/]+)\/images\/([a-f0-9]{64}\.(?:png|jpg|gif|webp))$/);
+      if (req.method === 'GET' && imageRoute) {
+        const chat = chats.find(chat => chat.id === imageRoute[1]);
+        if (!chat) return json(404, { error: 'Thread not found' });
+        const image = chat.images?.find(image => image.id === imageRoute[2]);
+        if (!image) return json(404, { error: 'Image not found' });
+        let bytes;
+        try { bytes = await images.read(chat, image.id); } catch { return json(404, { error: 'Image not found' }); }
+        res.writeHead(200, { 'Content-Type': 'image/' + (image.type === 'jpg' ? 'jpeg' : image.type), 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' }); res.end(bytes); return;
+      }
       const deletion = pathname.match(/^\/api\/chats\/([^/]+)$/);
       if (req.method === 'DELETE' && deletion) {
         const index = chats.findIndex(chat => chat.id === deletion[1]);
@@ -61,6 +73,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           active?.abort();
           if (active) await active.settled;
           if (chat.threadId) await (await getCodex()).deleteThread(chat.threadId);
+          await images.remove(chat.id);
           running.delete(chat.id);
           chats = chats.filter(item => item.id !== chat.id); await save();
           return json(200, { deleted: true });
@@ -139,7 +152,20 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
                 send({ type: 'activity', item: event.item });
                 if (event.type === 'item.completed') chat.messages.push({ ...event.item, role: 'activity' });
               }
-              if (event.type === 'item.completed' && event.item.type === 'agent_message') chat.messages.push({ role: 'assistant', text: event.item.text, phase: event.item.phase });
+              if (event.type === 'item.completed' && ['agent_message', 'image'].includes(event.item.type)) {
+                const message = { role: 'assistant', text: event.item.text || '', phase: event.item.phase };
+                const references = event.item.type === 'image' ? (event.item.references || [event.item]) : imageReferences(event.item.text);
+                message.images = []; message.imageErrors = [];
+                for (const reference of references.slice(0, 20)) {
+                  try {
+                    if (!reference.source && !reference.base64) continue;
+                    const image = await images.capture(chat, reference, chat.cwd || codex.cwd);
+                    if (!message.images.some(item => item.id === image.id)) message.images.push(image);
+                    send({ type: 'image', image });
+                  } catch (error) { message.imageErrors.push('Could not save image: ' + error.message); }
+                }
+                chat.messages.push(message);
+              }
               if (event.type === 'turn.failed') throw new Error(event.error.message);
               if (event.type === 'error') throw new Error(event.message);
             }

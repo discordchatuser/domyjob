@@ -4,6 +4,8 @@ A minimal local chat UI for Codex, with a Node backend and Vite frontend. The ba
 
 ## Features
 
+- **Thread images:** PNG, JPEG, GIF and WebP images referenced by replies or emitted by Codex are saved in `.data/images/<chat-id>/`. Click a preview or **Images** to browse the thread gallery, use arrow keys to navigate, or download a copy. Saved images survive reloads and are removed when the thread is deleted; original files in your working directory are retained. Downloads are limited to 20 MB per image.
+
 - **Voice:** click **Mic** to dictate into the prompt, then **Stop mic** to review and send. Escape also stops dictation. The Mic button is hidden in browsers without speech recognition or on insecure pages. Recognition uses your browser language and requires a supported browser and microphone permission. Browser speech recognition may send audio to its speech service and require internet access; no audio is stored by this app.
 
 - **Interactive choices:** Codex can pause to ask questions. Pick an option (click or use arrow keys), switch your choice, or type your own answer, then click **Send answers** to continue the same turn.
