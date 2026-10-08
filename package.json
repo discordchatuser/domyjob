@@ -7,12 +7,18 @@
     "server": "node --watch server/index.js",
     "build": "vite build",
     "start": "node server/index.js",
-    "test": "node --test server/*.test.js"
+    "test": "node --test server/*.test.js client/*.test.js"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
+    "jsdom": "^29.1.1",
     "vite": "6.4.1"
   },
   "engines": {
     "node": ">=20.19"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   }
 }

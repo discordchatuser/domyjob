@@ -23,7 +23,7 @@ class FakeRpc extends EventEmitter {
 
 test('adapts streamed messages and interrupts before cleaning and deleting', async () => {
   const rpc = new FakeRpc();
-  const client = createClient(rpc, { cwd: '/workspace' });
+  const client = createClient(rpc, { cwd: '/workspace', routing: false });
   const controller = new AbortController();
   const { events } = await client.start().runStreamed('Hello', { signal: controller.signal });
   const seen = [];
@@ -45,13 +45,14 @@ test('cleanup failure prevents deletion of the Codex thread', async () => {
     if (method === 'thread/backgroundTerminals/clean') throw new Error('Cleanup unsupported');
     return request(method, params);
   };
-  const client = createClient(rpc);
+  const client = createClient(rpc, { routing: false });
   await assert.rejects(client.deleteThread('thread-1'), /Cleanup unsupported/);
   assert.equal(rpc.calls.some(call => call.method === 'thread/delete'), false);
 });
 
 for (const dynamic of [false, true]) {
-  test(`answers ${dynamic ? 'dynamic ask_user' : 'native user input'} questions and resumes the same turn`, async () => {
+ for (const resumed of [false, true]) {
+  test(`answers ${dynamic ? 'dynamic ask_user' : 'native user input'} questions on ${resumed ? 'resumed' : 'new'} threads and resumes the same turn`, async () => {
     const rpc = new FakeRpc();
     const sent = [];
     rpc.send = message => {
@@ -72,8 +73,9 @@ for (const dynamic of [false, true]) {
       }
       return baseRequest(method, params);
     };
-    const client = createClient(rpc, { cwd: '/workspace' });
-    const { events } = await client.start('/another/folder').runStreamed('Build a todo app');
+    const client = createClient(rpc, { cwd: '/workspace', routing: false });
+    const thread = resumed ? client.resume('thread-1', '/another/folder') : client.start('/another/folder');
+    const { events } = await thread.runStreamed('Build a todo app');
     let requestId;
     for await (const event of events) {
       if (event.type !== 'questions') continue;
@@ -84,13 +86,17 @@ for (const dynamic of [false, true]) {
       client.answerQuestion('thread-1', requestId, { storage: { answers: ['Backend'] } });
     }
     assert.equal(rpc.calls[0].params.cwd, '/another/folder');
-    assert.equal(rpc.calls[0].params.dynamicTools[0].name, 'ask_user');
+    assert.equal(rpc.calls[0].method, resumed ? 'thread/resume' : 'thread/start');
+    assert.match(rpc.calls[0].params.developerInstructions, /retrying failed questions/);
+    assert.match(rpc.calls[0].params.developerInstructions, /ask_user works in Default mode/);
+    if (!resumed) assert.equal(rpc.calls[0].params.dynamicTools[0].name, 'ask_user');
     assert.equal(sent[0].id, 77);
     const result = dynamic ? JSON.parse(sent[0].result.contentItems[0].text) : sent[0].result;
     assert.deepEqual(result, { answers: { storage: { answers: ['Backend'] } } });
     assert.throws(() => client.answerQuestion('thread-1', requestId, {}), /no longer/);
     assert.equal(rpc.listenerCount('serverRequest'), 0);
   });
+ }
 }
 
 test('adapts generated, viewed and MCP images', async () => {
@@ -108,7 +114,7 @@ test('adapts generated, viewed and MCP images', async () => {
     });
     return { turn: { id: 'turn-1' } };
   };
-  const client = createClient(rpc);
+  const client = createClient(rpc, { routing: false });
   const { events } = await client.start().runStreamed('Create an image');
   const seen = []; for await (const event of events) if (event.item) seen.push(event.item);
   assert.equal(seen[0].base64, 'base64-image');

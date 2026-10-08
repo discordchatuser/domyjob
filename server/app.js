@@ -91,10 +91,12 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           input = await readJson(req);
           (await getCodex()).answerQuestion(chat.threadId, request.requestId, input.answers);
         } catch (error) { return json(400, { error: error.message }); }
-        chat.messages.push({ role: 'user', text: request.questions.map(q => q.question + '\n' + (q.isSecret ? '[Private answer]' : input.answers[q.id].answers.join(', '))).join('\n\n') });
+        const safeAnswers = Object.fromEntries(request.questions.map(q => [q.id, { answers: q.isSecret ? ['[Private answer]'] : input.answers[q.id].answers }]));
+        const message = { role: 'user', text: request.questions.map(q => q.question + '\n' + safeAnswers[q.id].answers.join(', ')).join('\n\n'), questionResponse: { requestId: request.requestId, questions: request.questions, answers: safeAnswers } };
+        chat.messages.push(message);
         questions.set(chat.id, (questions.get(chat.id) || []).filter(item => item.requestId !== request.requestId));
         running.get(chat.id)?.send?.({ type: 'questions.resolved', requestId: request.requestId });
-        await save(); return json(200, { answered: true });
+        await save(); return json(200, { answered: true, message });
       }
       const match = pathname.match(/^\/api\/chats\/([^/]+)\/messages$/);
       if (req.method === 'POST' && match) {
@@ -134,6 +136,16 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           try {
             const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal });
             for await (const event of events) {
+              if (event.type === 'model.routing') {
+                chat.routing = true; send(event);
+              }
+              if (event.type === 'model.changed') {
+                const previousModel = chat.model || null;
+                chat.model = event.route.model; chat.modelRoute = event.route; chat.routing = false;
+                const message = { role: 'model', modelRoute: { ...event.route, previousModel } };
+                chat.messages.push(message);
+                await save(); send({ ...event, previousModel, message });
+              }
               if (event.type === 'questions') {
                 questions.set(chat.id, [...(questions.get(chat.id) || []), event.request]);
                 send(event);
@@ -173,6 +185,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
             chat.messages.push({ role: 'error', text: error.message });
             send({ type: 'error', error: error.message });
           }
+          chat.routing = false;
           questions.delete(chat.id);
           await save(); running.delete(chat.id);
           send({ type: 'done', chat: summary(chat) }); res.end();

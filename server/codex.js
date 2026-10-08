@@ -4,6 +4,9 @@ import { CodexRpc } from './rpc.js';
 import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { delimiter, resolve } from 'node:path';
+import { loadRoutingSkill, routingPrompt, routingSchema, chooseRoute } from './model-route.js';
+
+const questionInstructions = 'This chat UI supports interactive question cards through the ask_user tool. Whenever you need clarification or the user asks you to ask questions (including retrying failed questions), call ask_user with concise selectable options. Do not replace the tool call with a numbered list of questions or tell the user to answer directly in chat. ask_user works in Default mode; do not use the Plan-mode-only request_user_input tool. For requests to build an app, ask about meaningful product or design choices before implementing. After answers, continue implementation; do not stay in planning mode.';
 
 export async function findCodex() {
   const candidates = process.env.CODEX_BIN
@@ -16,20 +19,23 @@ export async function findCodex() {
 }
 
 // Adapt app-server events to the chat handler's small event interface.
-export function createClient(rpc, { binary, cwd, model } = {}) {
+export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
   const loaded = new Set();
   const pendingQuestions = new Map();
   const options = { cwd, approvalPolicy: 'never', sandbox: 'workspace-write', ...(model ? { model } : {}) };
   function thread(existingId, workdir = cwd) {
     return { async runStreamed(prompt, { signal } = {}) {
       return { events: (async function* () {
-        const result = await rpc.request(existingId ? 'thread/resume' : 'thread/start', { ...options, cwd: workdir, ...(existingId ? { threadId: existingId } : { dynamicTools: [askUserTool], developerInstructions: 'For requests to build an app, ask the user about meaningful product or design choices using ask_user before implementing. Use ask_user for any further clarification with concise selectable options. After answers, continue implementation; do not stay in planning mode.' }) });
+        const skill = routing ? await loadRoutingSkill() : null;
+        const instructions = questionInstructions + (skill ? '\nBefore every user task, the application runs a ROUTING PREFLIGHT ONLY turn. During that turn, only classify difficulty as requested and return the required JSON; do not ask questions or perform the task. During the execution turn, the routing decision has already been applied; proceed with the task.\n\n' + skill.instructions : '');
+        const result = await rpc.request(existingId ? 'thread/resume' : 'thread/start', { ...options, cwd: workdir, developerInstructions: instructions, ...(existingId ? { threadId: existingId } : { dynamicTools: [askUserTool] }) });
         const threadId = result.thread.id;
         loaded.add(threadId);
         yield { type: 'thread.started', thread_id: threadId };
         if (signal?.aborted) return;
         const queue = [], items = new Map();
-        let wake, ended = false, failure, turnId, interrupting = false, interruptTimer;
+        let wake, ended = false, failure, turnId, interrupting = false, interruptTimer, assessing = Boolean(skill);
+        const assessmentItems = new Map();
         const push = event => { queue.push(event); wake?.(); };
         const fail = error => { failure = error; ended = true; wake?.(); };
         const interrupt = () => {
@@ -53,6 +59,9 @@ export function createClient(rpc, { binary, cwd, model } = {}) {
         const requestInput = request => {
           const p = request.params;
           if (p?.threadId !== threadId) return;
+          if (assessing) {
+            rpc.send({ id: request.id, error: { code: -32602, message: 'Routing preflight must return a difficulty assessment without tools.' } }); return;
+          }
           const dynamic = request.method === 'item/tool/call';
           if (dynamic && p.tool !== 'ask_user') {
             rpc.send({ id: request.id, result: { success: false, contentItems: [{ type: 'inputText', text: 'Unsupported tool' }] } }); return;
@@ -72,6 +81,16 @@ export function createClient(rpc, { binary, cwd, model } = {}) {
             for (const [id, question] of pendingQuestions) if (question.threadId === threadId && question.rpcId === p.requestId) { pendingQuestions.delete(id); push({ type: 'questions.resolved', requestId: id }); }
           }
           if (method === 'turn/started') { turnId = p.turn.id; if (signal?.aborted) interrupt(); }
+          if (assessing) {
+            if (['item/started', 'item/completed'].includes(method) && p.item.type === 'agentMessage') assessmentItems.set(p.item.id, { text: p.item.text || '', phase: p.item.phase });
+            if (method === 'item/agentMessage/delta') { const item = assessmentItems.get(p.itemId) || { text: '' }; assessmentItems.set(p.itemId, { ...item, text: item.text + p.delta }); }
+            if (method === 'turn/completed') {
+              if (p.turn.status === 'failed') failure = new Error(p.turn.error?.message || 'Difficulty assessment failed');
+              if (p.turn.status === 'interrupted') failure = new Error('Difficulty assessment interrupted');
+              ended = true; wake?.();
+            }
+            return;
+          }
           if (method === 'item/started' || method === 'item/completed') {
             const item = convert(p.item);
             if (item) { items.set(item.id, item); push({ type: method === 'item/started' ? 'item.started' : 'item.completed', item }); }
@@ -91,8 +110,37 @@ export function createClient(rpc, { binary, cwd, model } = {}) {
         };
         rpc.on('serverRequest', requestInput); rpc.on('notification', notify); rpc.on('failure', fail); signal?.addEventListener('abort', interrupt);
         try {
-          const started = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text: prompt }] });
+          let route;
+          if (skill) {
+            yield { type: 'model.routing' };
+            const available = [];
+            let cursor;
+            do {
+              const page = await rpc.request('model/list', { includeHidden: false, ...(cursor ? { cursor } : {}) });
+              available.push(...page.data); cursor = page.nextCursor;
+            } while (cursor);
+            if (signal?.aborted) return;
+            const classifier = available.find(item => item.model === skill.models.medium) || available.find(item => item.isDefault) || available[0];
+            if (!classifier) throw new Error('No models are available for difficulty assessment.');
+            const started = await rpc.request('turn/start', { threadId, model: classifier.model, sandboxPolicy: { type: 'readOnly', networkAccess: false }, input: [{ type: 'text', text: routingPrompt(prompt, skill) }], outputSchema: routingSchema });
+            turnId = started.turn.id;
+            if (signal?.aborted) interrupt();
+            while (!ended) { await new Promise(resolve => { wake = resolve; }); wake = null; }
+            if (signal?.aborted) return;
+            if (failure) throw failure;
+            const responses = [...assessmentItems.values()];
+            const text = responses.findLast(item => item.phase === 'final')?.text || responses.at(-1)?.text || '';
+            route = chooseRoute(text, skill, available, model);
+            // Reset the turn overrides used for the read-only assessment before execution.
+            await rpc.request('thread/resume', { ...options, threadId, cwd: workdir, model: route.model, developerInstructions: instructions });
+            if (signal?.aborted) return;
+            ended = false; failure = undefined; turnId = undefined; interrupting = false; clearTimeout(interruptTimer);
+          }
+          assessing = false;
+          const started = await rpc.request('turn/start', { threadId, ...(route ? { model: route.model } : {}), input: [{ type: 'text', text: prompt }] });
           turnId = started.turn.id;
+          if (route) yield { type: 'model.changed', route };
+          else if (result.model) yield { type: 'model.changed', route: { model: result.model } };
           if (signal?.aborted) interrupt();
           while (true) {
             while (queue.length) yield queue.shift();

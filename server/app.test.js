@@ -14,12 +14,17 @@ test('streams, persists, resumes and rejects overlapping turns', async () => {
   const deleted = [];
   let cleanupFails = false;
   let askQuestion = false;
+  let emitRouting = false;
   let answerRelease;
   const chosenAnswers = [];
   const prompts = [];
   const signals = [];
   const thread = { async runStreamed(prompt, options) { prompts.push(prompt); signals.push(options.signal); return { events: (async function* () {
     yield { type: 'thread.started', thread_id: 'local-thread-1' };
+    if (emitRouting) {
+      yield { type: 'model.routing' };
+      yield { type: 'model.changed', route: { tier: 'medium', model: 'gpt-6.1-sol', reason: 'Several connected decisions.' } };
+    }
     if (askQuestion) {
       const answered = new Promise(resolve => { answerRelease = resolve; });
       yield { type: 'questions', request: { requestId: 'question-1', questions: [{ id: 'style', question: 'Choose a style', options: [{ label: 'Minimal' }, { label: 'Colorful' }] }] } };
@@ -116,6 +121,7 @@ test('streams, persists, resumes and rejects overlapping turns', async () => {
     base = await start();
     assert.deepEqual(await (await fetch(base + '/api/chats')).json(), []);
     askQuestion = true;
+    emitRouting = true;
     const interactive = await (await post(base + '/api/chats', { cwd: dataDir })).json();
     assert.equal(interactive.cwd, dataDir);
     const interactiveResponse = await post(base + `/api/chats/${interactive.id}/messages`, { prompt: 'Build a todo app' });
@@ -126,6 +132,8 @@ test('streams, persists, resumes and rejects overlapping turns', async () => {
       await new Promise(resolve => setImmediate(resolve));
     }
     const questionState = await (await fetch(base + '/api/chats')).json();
+    assert.equal(questionState[0].model, 'gpt-6.1-sol');
+    assert.equal(questionState[0].routing, false);
     assert.equal(questionState[0].pendingQuestions[0].questions[0].question, 'Choose a style');
     assert.equal((await post(base + `/api/chats/${interactive.id}/questions/question-1`, { answers: { style: { answers: ['Colorful'] } } })).status, 200);
     await interactiveResponse.text();
@@ -134,6 +142,14 @@ test('streams, persists, resumes and rejects overlapping turns', async () => {
     const history = await (await fetch(base + '/api/chats')).json();
     assert.equal(history[0].pendingQuestions.length, 0);
     assert.ok(history[0].messages.some(message => message.text?.includes('Colorful')));
+    const answered = history[0].messages.find(message => message.questionResponse);
+    assert.equal(answered.questionResponse.requestId, 'question-1');
+    assert.equal(answered.questionResponse.answers.style.answers[0], 'Colorful');
+    assert.equal(answered.questionResponse.questions[0].options[1].label, 'Colorful');
+    base = await start();
+    const reloaded = await (await fetch(base + '/api/chats')).json();
+    assert.equal(reloaded[0].modelRoute.tier, 'medium');
+    assert.equal(reloaded[0].messages.find(message => message.modelRoute).modelRoute.model, 'gpt-6.1-sol');
   } finally {
     release?.();
     await rm(dataDir, { recursive: true, force: true });
