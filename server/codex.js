@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { askUserTool, validateQuestions, validateAnswers } from './questions.js';
 import { CodexRpc } from './rpc.js';
-import { access } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { access, mkdir, writeFile, rename } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { delimiter, resolve } from 'node:path';
-import { loadRoutingSkill, routingPrompt, routingSchema, chooseRoute } from './model-route.js';
+import { loadRoutingSkill } from './model-route.js';
+import { modelCatalog } from './model-catalog.js';
+import { usageStore } from './usage.js';
+import { selectWithJev } from './jev.js';
 
 const orchestratorInstructions = 'You are the persistent main orchestrator for this project. Keep project context, decisions, task progress and integration in this conversation. The user authorizes you to spawn and manage subagents as needed using the available collaboration tools. Delegate bounded work when useful, assign clear ownership, monitor progress, integrate results and verify the final outcome. Tell workers they share the codebase and must preserve others edits. Do not create replacement top-level project conversations. Handle small tasks directly; do not delegate just for appearances. Report delegation and material results clearly to the user. If collaboration tools are unavailable, report that limitation and continue useful work yourself.';
 
@@ -21,23 +25,34 @@ export async function findCodex() {
 }
 
 // Adapt app-server events to the chat handler's small event interface.
-export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
+export function createClient(rpc, { binary, cwd, model, routing = true, selectModel = selectWithJev, usage } = {}) {
+  const getModels = modelCatalog(rpc);
   const loaded = new Set();
   const pendingQuestions = new Map();
   const options = { cwd, approvalPolicy: 'never', sandbox: 'workspace-write', ...(model ? { model } : {}) };
   function thread(existingId, workdir = cwd) {
-    return { async runStreamed(prompt, { signal, orchestrator = false } = {}) {
+    return { async runStreamed(prompt, { signal, orchestrator = false, context = '', requestedModel, usageProject = '' } = {}) {
       return { events: (async function* () {
         const skill = routing ? await loadRoutingSkill() : null;
-        const instructions = questionInstructions + (orchestrator ? '\n\n' + orchestratorInstructions : '') + (skill ? '\nBefore every user task, the application runs a ROUTING PREFLIGHT ONLY turn. During that turn, only classify difficulty as requested and return the required JSON; do not ask questions or perform the task. During the execution turn, the routing decision has already been applied; proceed with the task.\n\n' + skill.instructions : '');
-        const result = await rpc.request(existingId ? 'thread/resume' : 'thread/start', { ...options, cwd: workdir, developerInstructions: instructions, ...(existingId ? { threadId: existingId } : { dynamicTools: [askUserTool] }) });
+        let route;
+        const available = routing ? await getModels() : [];
+        if (signal?.aborted) return;
+        if (skill) {
+          yield { type: 'model.routing' };
+          route = await selectModel({ task: prompt, context, available, skill, pinnedModel: requestedModel || model, signal, reportUsage: usage?.record, usageContext: { project: usageProject } });
+          if (signal?.aborted) return;
+          if (!available.some(item => item.model === route.model)) throw new Error('Model router selected a model outside the Codex catalog.');
+        }
+        const routingInstructions = skill ? '\nThe application uses JEV to select your model before execution. Proceed directly with the task. For every delegated subtask, call the jev_router MCP choose_model tool with a bounded task description and project ' + JSON.stringify(usageProject) + ', then pass its returned model to spawn_agent. If model overrides require isolated context, use fork_turns none and supply the worker enough task context. Report any fallback warning. Keep the parent conversation as the orchestrator. Choose only from this startup Codex catalog: ' + JSON.stringify(available.map(item => ({ model: item.model, description: item.description || '' }))) : '';
+        const instructions = questionInstructions + (orchestrator ? '\n\n' + orchestratorInstructions : '') + routingInstructions;
+        const result = await rpc.request(existingId ? 'thread/resume' : 'thread/start', { ...options, cwd: workdir, ...(route ? { model: route.model } : {}), developerInstructions: instructions, ...(existingId ? { threadId: existingId } : { dynamicTools: [askUserTool] }) });
         const threadId = result.thread.id;
+        const tracked = new Map([[threadId, route?.model || model || result.model || 'Codex']]);
         loaded.add(threadId);
         yield { type: 'thread.started', thread_id: threadId };
         if (signal?.aborted) return;
         const queue = [], items = new Map();
-        let wake, ended = false, failure, turnId, interrupting = false, interruptTimer, assessing = Boolean(skill);
-        const assessmentItems = new Map();
+        let wake, ended = false, failure, turnId, interrupting = false, interruptTimer;
         const push = event => { queue.push(event); wake?.(); };
         const fail = error => { failure = error; ended = true; wake?.(); };
         const interrupt = () => {
@@ -54,21 +69,19 @@ export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
           if (item.type === 'mcpToolCall') {
             const references = (item.result?.content || []).filter(content => content.type === 'image' && typeof content.data === 'string').map(content => ({ source: '', base64: content.data, name: item.tool + ' image' }));
             if (references.length) return { id: item.id, type: 'image', references };
-            return { id: item.id, type: 'activity', label: 'Called ' + item.server + '/' + item.tool, output: item.error?.message || '', status: item.status };
+            const decision = item.server === 'jev_router' && item.tool === 'choose_model' ? (item.result?.content || []).filter(content => content.type === 'text').map(content => content.text).join('\n') : '';
+            return { id: item.id, type: 'activity', label: 'Called ' + item.server + '/' + item.tool, output: item.error?.message || decision, status: item.status };
           }
           if (item.type === 'collabAgentToolCall') {
             const labels = { spawnAgent: 'Spawned subagent', sendInput: 'Directed subagent', resumeAgent: 'Resumed subagent', wait: 'Waiting for subagents', closeAgent: 'Closed subagent' };
             const states = Object.entries(item.agentsStates || {}).map(([id, state]) => id + ': ' + state.status + (state.message ? '\n' + state.message : ''));
-            return { id: item.id, type: 'activity', label: labels[item.tool] || 'Subagent activity', output: [item.prompt, ...states].filter(Boolean).join('\n\n'), status: item.status === 'inProgress' ? 'in_progress' : item.status };
+            return { id: item.id, type: 'activity', label: labels[item.tool] || 'Subagent activity', output: [item.model ? 'Model: ' + item.model : '', item.prompt, ...states].filter(Boolean).join('\n\n'), status: item.status === 'inProgress' ? 'in_progress' : item.status };
           }
           if (item.type === 'commandExecution') return { id: item.id, type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput || '', exit_code: item.exitCode, status: item.status, duration_ms: item.durationMs };
         };
         const requestInput = request => {
           const p = request.params;
           if (p?.threadId !== threadId) return;
-          if (assessing) {
-            rpc.send({ id: request.id, error: { code: -32602, message: 'Routing preflight must return a difficulty assessment without tools.' } }); return;
-          }
           const dynamic = request.method === 'item/tool/call';
           if (dynamic && p.tool !== 'ask_user') {
             rpc.send({ id: request.id, result: { success: false, contentItems: [{ type: 'inputText', text: 'Unsupported tool' }] } }); return;
@@ -83,21 +96,15 @@ export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
           push({ type: 'questions', request: publicRequest });
         };
         const notify = ({ method, params: p }) => {
+          if (tracked.has(p?.threadId) && method === 'thread/tokenUsage/updated' && p.tokenUsage?.total && usage) {
+            usage.record({ id: 'codex:' + p.threadId, provider: 'codex', project: usageProject, model: tracked.get(p.threadId), task: prompt.slice(0, 160), tokens: p.tokenUsage.total, cost: null }).catch(() => console.error('Could not save Codex usage.'));
+          }
           if (p?.threadId !== threadId) return;
+          if (p.item?.type === 'collabAgentToolCall') for (const id of p.item.receiverThreadIds || []) tracked.set(id, p.item.model || 'Subagent');
           if (method === 'serverRequest/resolved') {
             for (const [id, question] of pendingQuestions) if (question.threadId === threadId && question.rpcId === p.requestId) { pendingQuestions.delete(id); push({ type: 'questions.resolved', requestId: id }); }
           }
           if (method === 'turn/started') { turnId = p.turn.id; if (signal?.aborted) interrupt(); }
-          if (assessing) {
-            if (['item/started', 'item/completed'].includes(method) && p.item.type === 'agentMessage') assessmentItems.set(p.item.id, { text: p.item.text || '', phase: p.item.phase });
-            if (method === 'item/agentMessage/delta') { const item = assessmentItems.get(p.itemId) || { text: '' }; assessmentItems.set(p.itemId, { ...item, text: item.text + p.delta }); }
-            if (method === 'turn/completed') {
-              if (p.turn.status === 'failed') failure = new Error(p.turn.error?.message || 'Difficulty assessment failed');
-              if (p.turn.status === 'interrupted') failure = new Error('Difficulty assessment interrupted');
-              ended = true; wake?.();
-            }
-            return;
-          }
           if (method === 'item/started' || method === 'item/completed') {
             const item = convert(p.item);
             if (item) { items.set(item.id, item); push({ type: method === 'item/started' ? 'item.started' : 'item.completed', item }); }
@@ -117,33 +124,6 @@ export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
         };
         rpc.on('serverRequest', requestInput); rpc.on('notification', notify); rpc.on('failure', fail); signal?.addEventListener('abort', interrupt);
         try {
-          let route;
-          if (skill) {
-            yield { type: 'model.routing' };
-            const available = [];
-            let cursor;
-            do {
-              const page = await rpc.request('model/list', { includeHidden: false, ...(cursor ? { cursor } : {}) });
-              available.push(...page.data); cursor = page.nextCursor;
-            } while (cursor);
-            if (signal?.aborted) return;
-            const classifier = available.find(item => item.model === skill.models.medium) || available.find(item => item.isDefault) || available[0];
-            if (!classifier) throw new Error('No models are available for difficulty assessment.');
-            const started = await rpc.request('turn/start', { threadId, model: classifier.model, sandboxPolicy: { type: 'readOnly', networkAccess: false }, input: [{ type: 'text', text: routingPrompt(prompt, skill) }], outputSchema: routingSchema });
-            turnId = started.turn.id;
-            if (signal?.aborted) interrupt();
-            while (!ended) { await new Promise(resolve => { wake = resolve; }); wake = null; }
-            if (signal?.aborted) return;
-            if (failure) throw failure;
-            const responses = [...assessmentItems.values()];
-            const text = responses.findLast(item => item.phase === 'final')?.text || responses.at(-1)?.text || '';
-            route = chooseRoute(text, skill, available, model);
-            // Reset the turn overrides used for the read-only assessment before execution.
-            await rpc.request('thread/resume', { ...options, threadId, cwd: workdir, model: route.model, developerInstructions: instructions });
-            if (signal?.aborted) return;
-            ended = false; failure = undefined; turnId = undefined; interrupting = false; clearTimeout(interruptTimer);
-          }
-          assessing = false;
           const started = await rpc.request('turn/start', { threadId, ...(route ? { model: route.model } : {}), input: [{ type: 'text', text: prompt }] });
           turnId = started.turn.id;
           if (route) yield { type: 'model.changed', route };
@@ -165,7 +145,11 @@ export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
     } };
   }
   return {
-    binary, cwd, model: model || 'Auto · local Codex default',
+    binary, cwd, getModels, model: model || 'Auto · JEV', routingConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
+    async getAccountUsage() {
+      try { const result = await rpc.request('account/rateLimits/read', {}); return { limits: result.rateLimits || null }; }
+      catch { return { limits: null }; }
+    },
     start: workdir => thread(undefined, workdir), resume: (id, workdir) => thread(id, workdir),
     answerQuestion(threadId, requestId, answers) {
       const question = pendingQuestions.get(requestId);
@@ -194,6 +178,13 @@ export async function createCodex() {
   try {
     await rpc.request('initialize', { clientInfo: { name: 'local_codex_chat', title: 'Local Codex Chat', version: '0.1.0' }, capabilities: { experimentalApi: true } });
     rpc.send({ method: 'initialized', params: {} });
-    return createClient(rpc, { binary, cwd: resolve(process.env.CODEX_WORKDIR || process.cwd()), model: process.env.CODEX_MODEL });
+    const client = createClient(rpc, { binary, cwd: resolve(process.env.CODEX_WORKDIR || process.cwd()), model: process.env.CODEX_MODEL, usage: usageStore(fileURLToPath(new URL('../.data/', import.meta.url))) });
+    const models = await client.getModels();
+    const directory = fileURLToPath(new URL('../.data/', import.meta.url));
+    await mkdir(directory, { recursive: true });
+    const catalog = resolve(directory, 'model-catalog.json');
+    await writeFile(catalog + '.tmp', JSON.stringify(models));
+    await rename(catalog + '.tmp', catalog);
+    return client;
   } catch (error) { rpc.close(); throw error; }
 }

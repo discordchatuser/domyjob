@@ -1,10 +1,14 @@
+import './env.js';
 import { createApp } from './app.js';
 import { createCodex } from './codex.js';
 let codexPromise;
-const server = await createApp({ getCodex: async () => {
+async function getCodex() {
   if (!codexPromise) codexPromise = createCodex().catch(error => { codexPromise = null; throw error; });
   return codexPromise;
-} });
+}
+const server = await createApp({ getCodex });
+// Warm the catalog once for this backend process, even before the browser opens.
+getCodex().catch(error => console.error('Codex startup:', error.message));
 server.listen(3001, '127.0.0.1', () => console.log('Backend: http://127.0.0.1:3001'));
 
 let stopping = false;

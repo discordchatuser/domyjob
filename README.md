@@ -12,7 +12,7 @@ A minimal local chat UI for Codex, with a Node backend and React frontend built 
 - **Projects from disk:** click **Load project…**, browse folders (including parent folders), or enter an absolute path, then load the selected folder into a new thread. For TROPHY, select `/Users/veljko/Arbeit/TROPHY`.
 - **Project servers:** each loaded project has an editable server command and **Start server**, **Stop**, and a terminal console. Laravel projects default to `composer dev`; Node projects use `npm run dev` or `npm start`. Console output refreshes while the process runs, including stdout, stderr, startup errors and exit status. The xterm.js viewer renders ANSI colors, Unicode, carriage-return progress updates and cursor/erase sequences. Color output is enabled for new server processes. The console displays output only; it does not provide interactive shell input or a PTY. Servers are shared across threads with the same folder and continue when switching threads or reloading the page. Stop them explicitly; app shutdown also stops managed process groups. Output is capped at the latest 200,000 characters and resets on each start. Processes and output are not restored after restarting the backend.
 
-- **Automatic model routing:** before each task, including in existing threads, Codex assesses difficulty using `skills/model-route/SKILL.md`, then the app selects Luna for easy work, Sol for medium work, or Astra for hard work. The header shows the active model and tier; the transcript records switches and reasons across reloads. Explicit model requests and `CODEX_MODEL` override the automatic choice. Unavailable models produce a visible fallback notice. Assessment is a separate read-only turn in the same conversation and adds an inference step before execution.
+- **JEV model routing:** Codex's advertised model catalog is loaded once at backend startup. Before each task, JEV selects a model from that catalog through OpenRouter. The header offers **Task model → Auto · JEV** or a manual model override; the transcript records the chosen model, difficulty, confidence and fallback warnings. The orchestrator uses the `jev_router` MCP `choose_model` tool before delegated subtasks. Task execution still uses your Codex login.
 
 - **Thread images:** PNG, JPEG, GIF and WebP images referenced by replies or emitted by Codex are saved in `.data/images/<chat-id>/`. Click a preview or **Images** to browse the thread gallery, use arrow keys to navigate, or download a copy. Saved images survive reloads and are removed when the thread is deleted; original files in your working directory are retained. Downloads are limited to 20 MB per image.
 
@@ -28,17 +28,24 @@ A minimal local chat UI for Codex, with a Node backend and React frontend built 
 
 ## Model routing
 
-The backend reads [the routing skill](skills/model-route/SKILL.md) before every task, so edits to its criteria or model table apply to the next message. Difficulty depends on reasoning and uncertainty rather than task length:
+The backend loads its root `.env` automatically. Fill in the blank key in `.env` (or copy `.env.example` first on a new checkout), then restart the backend:
 
-| Difficulty | Model | Typical work |
-| --- | --- | --- |
-| Easy | `gpt-6-luna` | Small edits, formatting, obvious fixes |
-| Medium | `gpt-6.1-sol` | Features, everyday debugging, connected decisions |
-| Hard | `gpt-6-astra` | Complex architecture, ambiguous requirements, elusive bugs |
+```dotenv
+OPENROUTER_API_KEY=your-key-here
+JEV_MODEL=typesafe/jev-1.13
+```
 
-The app first runs a read-only assessment in the same Codex thread, then restores the working-directory sandbox and starts execution with the selected model. While assessing, the header shows **Assessing task difficulty…**. Once execution starts, it shows the model and difficulty; the conversation records the reason and any model change.
+`.env` is Git-ignored; `.env.example` contains only placeholders. Existing exported environment variables take precedence. Keep the key on the backend; it is never returned to the browser.
 
-An explicitly requested model takes precedence over `CODEX_MODEL`, which otherwise pins the execution model. The app checks Codex's model catalog and displays a fallback notice if the preferred model is unavailable. An invalid or failed assessment stops execution and reports an error. This assessment adds an inference step to each task; answering an interactive question continues the existing task without another assessment.
+At startup, the app calls Codex `model/list` and follows pagination once, caches the catalog in memory, and writes `.data/model-catalog.json` for the local JEV MCP tool. Reloading the browser and submitting tasks reuse this catalog. Restart the backend to refresh it. If discovery fails, the UI reports Codex unavailable; a later connection attempt can retry initialization.
+
+For each user task, the app sends the task, up to eight recent user/assistant messages (capped at 12,000 characters), and catalog descriptions to [JEV's Decisions API](https://openrouter.ai/docs/guides/community/jev-tutorial). This is an OpenRouter request billed separately from Codex. JEV chooses a model and difficulty, without an extra Codex inference preflight. Its confidence is recorded as decision metadata, not a guarantee of correctness. It does not generate explanations; the displayed reason is an application label.
+
+The existing [routing policy](skills/model-route/SKILL.md) supplies preferred easy/medium/hard model profiles when those IDs appear in the catalog. JEV can also select newly advertised models using their descriptions. A manual **Task model** selection takes precedence over `CODEX_MODEL`; either bypasses JEV for that task. The manual selection resets after sending. Missing credentials, timeout, provider error or malformed decisions visibly fall back to the policy's medium model, Codex's default, or the first advertised model. A canceled request never starts execution.
+
+Codex app-server also launches the local `jev_router` stdio MCP tool for new and existing project conversations. The orchestrator is instructed to call `choose_model` with each bounded subtask before spawning a worker and to use its returned model. This uses the same startup catalog and fallback policy. Delegation remains the orchestrator's responsibility; the app does not automatically fan out every request. **Task model** applies to the parent task; `CODEX_MODEL` also pins worker routing.
+
+Tests use mocked OpenRouter responses; no real JEV request has been verified without your key.
 
 ## Run
 
@@ -51,7 +58,7 @@ npm run dev
 
 Open http://127.0.0.1:5173. The backend runs on port 3001. Both bind locally; inference requires internet access.
 
-Optional environment variables: `CODEX_BIN` (executable path), `CODEX_WORKDIR` (working directory), and `CODEX_MODEL` (model override).
+Optional environment variables: `CODEX_BIN` (executable path), `CODEX_WORKDIR` (working directory), `CODEX_MODEL` (model override), `OPENROUTER_API_KEY`, and `JEV_MODEL` (optional decision-model override).
 
 For a production build served locally:
 
@@ -74,3 +81,11 @@ npm run build # Production frontend bundle
 ```
 
 Tests cover routing, cancellation, saved model metadata, question selection during streaming, thread drafts, answer retries, gallery navigation, and mocked voice dictation. They do not make live inference requests. `npm run dev` watches the backend and serves the frontend through Vite; when using `npm start`, restart the backend after server changes and rebuild after frontend changes.
+
+### Usage reporting
+
+Open **Usage** in the header or project tabs to inspect recorded JEV request costs, Codex thread tokens, and account limits. Project reports can switch to all projects. Refresh reloads local history; provider account information is cached for one minute.
+
+Usage is stored in `.data/usage` and survives restarts and chat deletion. JEV costs come from the Decisions API response. OpenRouter key totals include all applications using that key; remaining allowance is a key limit, not an account credit balance. Missing costs remain unavailable. Codex does not report subscription usage as a dollar cost, so no API price estimates are applied.
+
+Codex reporting keeps one cumulative snapshot per observed thread, preventing duplicate notifications from inflating totals. Resumed threads can include usage from before tracking began. The task column describes the latest observed task, not a per-task token breakdown. Subagents are included when their usage notifications are delivered during the orchestrator turn. JEV subtask calls pass the project path for attribution; calls without it appear as unassigned. Historical JEV requests and usage outside this app are only reflected in provider account totals.

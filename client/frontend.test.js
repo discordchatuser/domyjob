@@ -57,7 +57,7 @@ test('React chat preserves choices and drafts, retries answers, streams replies,
   const submissions = [];
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
-    if (url === '/api/status') return Response.json({ ready: true, model: 'Test model' });
+    if (url === '/api/status') return Response.json({ ready: true, model: 'Test model', routingConfigured: true, models: [{ model: 'gpt-6-luna', displayName: 'Luna' }, { model: 'gpt-6-astra', displayName: 'Astra' }] });
     if (url === '/api/chats') return Response.json(chats);
     if (url.endsWith('/questions/q1')) {
       submissions.push(JSON.parse(options.body));
@@ -122,15 +122,23 @@ test('React chat preserves choices and drafts, retries answers, streams replies,
     await click(document.querySelector('#dictate'));
     assert.equal(document.querySelector('#prompt').value, 'First draft dictated text');
     assert.equal(document.querySelector('#prompt').readOnly, false);
+    const modelPicker = document.querySelector('select[aria-label="Task model"]');
+    assert.equal(modelPicker.options.length, 3);
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, 'value').set.call(modelPicker, 'gpt-6-astra');
+      modelPicker.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+    });
     await click(document.querySelector('#send'));
     assert.equal(submissions.at(-1).prompt, 'First draft dictated text');
+    assert.equal(submissions.at(-1).model, 'gpt-6-astra');
     await emit({ type: 'model.routing' });
-    assert.match(document.querySelector('#model').textContent, /Assessing task difficulty/);
-    const route = { model: 'gpt-6-astra', tier: 'hard', reason: 'Complex architecture.' };
+    assert.match(document.querySelector('#model').textContent, /Choosing task model/);
+    const route = { model: 'gpt-6-astra', tier: 'hard', reason: 'JEV model selection.', source: 'jev', confidence: .9 };
     const modelMessage = { role: 'model', modelRoute: { ...route, previousModel: 'gpt-6.1-sol' } };
     await emit({ type: 'model.changed', route, message: modelMessage });
     assert.equal(document.querySelector('#model').textContent, 'gpt-6-astra · hard');
     assert.match(document.querySelector('.model-change').textContent, /gpt-6.1-sol → gpt-6-astra/);
+    assert.match(document.querySelector('.model-change').textContent, /JEV · 90% confidence/);
     await click([...document.querySelectorAll('#threads button')].find(button => button.textContent === 'Second thread'));
     assert.equal(document.querySelector('#model').textContent, 'Test model');
     await click([...document.querySelectorAll('#threads button')].find(button => button.textContent === 'First thread'));

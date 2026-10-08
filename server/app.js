@@ -1,3 +1,4 @@
+import { usageStore, openRouterAccount } from './usage.js';
 import { migrateProjectChats, projectOrchestrator } from './project-chats.js';
 import { projectContent, readDocument } from './project-content.js';
 import { browseFolders, projectInfo, projectServers } from './projects.js';
@@ -10,6 +11,9 @@ import { resolve, extname } from 'node:path';
 export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' }) {
   await mkdir(dataDir, { recursive: true });
   const images = imageStore(dataDir);
+  const usage = usageStore(dataDir);
+  let accountCache;
+  let accountAt = 0;
   const file = resolve(dataDir, 'chats.json');
   let chats;
   try { chats = JSON.parse(await readFile(file, 'utf8')); }
@@ -73,8 +77,16 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           if (req.method === 'DELETE') return json(200, await servers.stop(input.cwd));
         } catch (error) { return json(400, { error: error.message }); }
       }
+      if (req.method === 'GET' && pathname === '/api/usage') {
+        res.setHeader('Cache-Control', 'no-store');
+        if (!accountCache || Date.now() - accountAt > 60000) {
+          accountCache = Promise.all([openRouterAccount(), getCodex().then(c => c.getAccountUsage?.()).catch(() => null)]).then(([openrouter, codex]) => ({ openrouter, codex }));
+          accountAt = Date.now();
+        }
+        return json(200, { records: await usage.records(), accounts: await accountCache });
+      }
       if (req.method === 'GET' && pathname === '/api/status') {
-        try { const codex = await getCodex(); return json(200, { ready: true, binary: codex.binary, model: codex.model }); }
+        try { const codex = await getCodex(); return json(200, { ready: true, binary: codex.binary, model: codex.model, models: codex.getModels ? (await codex.getModels()).map(item => ({ model: item.model, displayName: item.displayName || item.model })) : [], routingConfigured: codex.routingConfigured || false }); }
         catch (error) { return json(200, { ready: false, error: error.message }); }
       }
       if (req.method === 'GET' && pathname === '/api/chats') return json(200, chats.map(summary));
@@ -159,7 +171,10 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           const codexPrompt = commands.length
             ? 'Run these shell commands in the working directory and report their output and exit status. For a long-running server, report startup output and return rather than waiting indefinitely.\n' + commands.map(command => JSON.stringify(command)).join('\n') + (input.prompt.trim() ? '\n\nUser request:\n' + input.prompt.trim() : '')
             : input.prompt.trim();
+          if (input.model !== undefined && typeof input.model !== 'string') return json(400, { error: 'Invalid model' });
           const codex = await getCodex();
+          if (input.model && codex.getModels && !(await codex.getModels()).some(item => item.model === input.model)) return json(400, { error: 'Model is not in the startup catalog' });
+          const context = chat.messages.filter(message => ['user', 'assistant'].includes(message.role)).slice(-8).map(message => message.role + ': ' + (message.text || '')).join('\n').slice(-12000);
           const thread = chat.threadId ? codex.resume(chat.threadId, chat.cwd) : codex.start(chat.cwd);
           chat.messages.push({ role: 'user', text: input.prompt.trim(), ...(commands.length ? { commands } : {}) });
           if (chat.title === 'New thread') chat.title = (input.prompt.trim() || commands[0]).slice(0, 48);
@@ -171,7 +186,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           if (controller.signal.aborted) { res.end(); return; }
           send({ type: 'chat', chat: summary(chat) });
           try {
-            const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal, orchestrator: Boolean(chat.orchestrator) });
+            const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal, orchestrator: Boolean(chat.orchestrator), context, requestedModel: input.model || undefined, usageProject: chat.cwd || '' });
             for await (const event of events) {
               if (event.type === 'model.routing') {
                 chat.routing = true; send(event);

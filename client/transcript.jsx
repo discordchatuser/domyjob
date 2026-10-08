@@ -7,7 +7,7 @@ export function Message({ item, onOpenImage }) {
   const [open, setOpen] = useState(false);
   if (item.modelRoute) {
     const route = item.modelRoute;
-    return <div className="model-change" role="status"><strong>{route.previousModel && route.previousModel !== route.model ? `${route.previousModel} → ${route.model}` : `Model: ${route.model}`}</strong>{route.tier && <span className="model-tier">{route.tier}</span>}{route.reason && <p>{route.reason}</p>}{route.warning && <p className="model-warning">{route.warning}</p>}</div>;
+    return <div className="model-change" role="status"><strong>{route.previousModel && route.previousModel !== route.model ? `${route.previousModel} → ${route.model}` : `Model: ${route.model}`}</strong>{route.source === 'jev' && <span className="model-tier">JEV{typeof route.confidence === 'number' ? ` · ${Math.round(route.confidence * 100)}% confidence` : ''}</span>}{route.tier && <span className="model-tier">{route.tier}</span>}{route.reason && <p>{route.reason}</p>}{route.warning && <p className="model-warning">{route.warning}</p>}</div>;
   }
   if (item.questionResponse) return <AnsweredQuestionCard request={item.questionResponse} />;
   const activity = activityFromMessage(item);

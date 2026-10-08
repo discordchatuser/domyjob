@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
@@ -6,7 +7,7 @@ export class CodexRpc extends EventEmitter {
   constructor(binary) {
     super();
     this.pending = new Map(); this.nextId = 1; this.failure = null;
-    this.child = spawn(binary, ['app-server', '--enable', 'multi_agent', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.child = spawn(binary, ['app-server', '--enable', 'multi_agent', '-c', 'mcp_servers.jev_router.command=' + JSON.stringify(process.execPath), '-c', 'mcp_servers.jev_router.args=' + JSON.stringify([fileURLToPath(new URL('./jev-mcp.js', import.meta.url)), fileURLToPath(new URL('../.data/model-catalog.json', import.meta.url))]), '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
     this.child.stderr.on('data', data => { stderr = (stderr + data).slice(-4000); });
     this.lines = createInterface({ input: this.child.stdout });

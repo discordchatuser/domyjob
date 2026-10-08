@@ -146,3 +146,26 @@ test('orchestrator exposes subagent spawn and result activity in the transcript'
   assert.match(activities[1].output, /worker: completed\nTests pass/);
   assert.equal(rpc.listenerCount('notification'), 0);
 });
+
+test('records parent and observed child usage with project attribution', async () => {
+  const rpc = new FakeRpc(), records = [];
+  const original = rpc.request.bind(rpc);
+  rpc.request = async (method, params) => {
+    if (method !== 'turn/start') return original(method, params);
+    queueMicrotask(() => {
+      const emit = (method, params) => rpc.emit('notification', { method, params });
+      emit('item/started', { threadId: 'thread-1', item: { id: 'spawn', type: 'collabAgentToolCall', tool: 'spawnAgent', receiverThreadIds: ['child'], model: 'small', status: 'inProgress' } });
+      for (const threadId of ['thread-1', 'child', 'unrelated']) emit('thread/tokenUsage/updated', { threadId, tokenUsage: { total: { totalTokens: 50, inputTokens: 40, cachedInputTokens: 10, outputTokens: 10, reasoningOutputTokens: 3 } } });
+      emit('turn/completed', { threadId: 'thread-1', turn: { status: 'completed' } });
+    });
+    return { turn: { id: 'turn' } };
+  };
+  const client = createClient(rpc, { routing: false, usage: { record: async event => records.push(event) } });
+  const { events } = await client.start().runStreamed('Build feature', { usageProject: '/project' });
+  for await (const event of events) { /* consume */ }
+  assert.equal(records.length, 2);
+  assert.equal(records[1].id, 'codex:child');
+  assert.equal(records[1].model, 'small');
+  assert.equal(records[0].project, '/project');
+  assert.equal(records[0].tokens.totalTokens, 50);
+});

@@ -1,3 +1,4 @@
+import { UsagePage } from './usage.jsx';
 import { ProjectPage } from './project-page.jsx';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { FolderBrowser, ProjectConsole } from './project.jsx';
@@ -147,7 +148,7 @@ export default function App() {
       setDrafts(previous => ({ ...previous, [id]: emptyDraft(), ...(chat ? {} : { new: emptyDraft() }) }));
       setError('');
       setChats(previous => previous.map(item => item.id === id ? { ...item, stream: {}, messages: [...item.messages, { role: 'user', text, commands }] } : item));
-      const response = await fetch(`/api/chats/${id}/messages`, { ...post({ prompt: text, commands }), signal: controller.signal });
+      const response = await fetch(`/api/chats/${id}/messages`, { ...post({ prompt: text, commands, ...(draft.model ? { model: draft.model } : {}) }), signal: controller.signal });
       if (!response.ok) throw new Error((await response.json()).error || 'Request failed');
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '', doneReceived = false;
       function handle(line) {
@@ -185,15 +186,16 @@ export default function App() {
     <div className="project-tabs-bar"><div className="brand">◈ <strong>Local Codex</strong></div>
       <div className="project-tabs" role="tablist" aria-label="Projects"><button role="tab" aria-selected={!project} onClick={() => chooseProject('')}>General</button>{projects.map(cwd => <button role="tab" key={cwd} title={cwd} aria-selected={project === cwd} onClick={() => chooseProject(cwd)}><span>◇</span> {cwd.split('/').filter(Boolean).at(-1)}</button>)}</div>
       <button className="load-project" onClick={() => setBrowsing(true)}>＋ Load project</button>
-      <label className="scheme-picker"><span>Appearance</span><select aria-label="Color scheme" value={scheme} onChange={event => { const next = event.target.value; setScheme(next); try { window.localStorage.setItem('color-scheme', next); } catch {} }}><option value="slate">Slate</option><option value="midnight">Midnight</option><option value="sand">Sand</option></select></label>
+      <button aria-pressed={view === 'usage'} onClick={() => setView(view === 'usage' ? 'chat' : 'usage')}>Usage</button><label className="scheme-picker"><span>Appearance</span><select aria-label="Color scheme" value={scheme} onChange={event => { const next = event.target.value; setScheme(next); try { window.localStorage.setItem('color-scheme', next); } catch {} }}><option value="slate">Slate</option><option value="midnight">Midnight</option><option value="sand">Sand</option></select></label>
     </div>
     <main className={project ? 'has-project' : 'general-workspace'}>
       {project && <><header className="workspace-header"><div><strong>{project.split('/').filter(Boolean).at(-1)}</strong><small>{project}</small></div>
-        <div className="view-tabs" role="tablist" aria-label="Project views">{[['tasks', 'Tasks'], ['docs', 'Documents'], ['terminal', 'Terminal'], ['chat', 'Chat']].map(([key, title]) => <button role="tab" key={key} aria-selected={view === key} onClick={() => setView(key)}>{title}{key === 'chat' && busy ? ' •' : ''}</button>)}</div>
+        <div className="view-tabs" role="tablist" aria-label="Project views">{[['tasks', 'Tasks'], ['docs', 'Documents'], ['terminal', 'Terminal'], ['chat', 'Chat'], ['usage', 'Usage']].map(([key, title]) => <button role="tab" key={key} aria-selected={view === key} onClick={() => setView(key)}>{title}{key === 'chat' && busy ? ' •' : ''}</button>)}</div>
       </header></>}
       <div className={'work-area' + (project && view === 'chat' ? ' chat-workspace' : '')}>
-        {project && <div className="project-surface" hidden={view === 'chat'}><div hidden={view === 'terminal'} className="project-content-slot"><ProjectPage key={project} cwd={project} section={view} onSectionChange={setView} /></div><div hidden={view !== 'terminal'} className="terminal-slot">{view === 'terminal' && <ProjectConsole key={project} cwd={project} expanded />}</div></div>}
-        <section className="chat-panel" hidden={!!project && view !== 'chat'} aria-label={project ? 'Project chat' : 'General chat'}>
+        {view === 'usage' && <UsagePage key={project} project={project} />}
+        {project && <div className="project-surface" hidden={view === 'chat' || view === 'usage'}><div hidden={view === 'terminal'} className="project-content-slot"><ProjectPage key={project} cwd={project} section={view} onSectionChange={setView} /></div><div hidden={view !== 'terminal'} className="terminal-slot">{view === 'terminal' && <ProjectConsole key={project} cwd={project} expanded />}</div></div>}
+        <section className="chat-panel" hidden={view === 'usage' || (!!project && view !== 'chat')} aria-label={project ? 'Project chat' : 'General chat'}>
           {!project && <div className="thread-navigation">
           <div className="chat-heading"><strong>{project ? 'Project chat' : 'Conversations'}</strong><button id="new" onClick={newThread} disabled={creating}>＋ New thread</button></div>
           <nav id="threads" aria-label="Threads">{projectThreads.map(item => <div className="thread-row" key={item.id}><button className={item.id === selected ? 'active' : ''} onClick={() => chooseThread(item.id)}>{item.busy ? '• ' : ''}{item.title}</button><button className="delete-thread" title="Delete thread" aria-label={'Delete ' + item.title} onClick={() => deleteThread(item.id)}>×</button></div>)}</nav>
@@ -201,14 +203,15 @@ export default function App() {
           </div>}
           <header className="chat-meta"><span id="title" title={chat?.cwd || 'Default working directory'}>{project ? 'Project orchestrator' : chat?.title || 'New conversation'}</span>
             <button id="gallery" type="button" hidden={!chat?.images?.length} onClick={() => openImage()}>Images ({chat?.images?.length || 0})</button>
-            <span id="model" className={chat?.routing ? 'routing' : ''} role="status" title={chat?.modelRoute?.reason || status.binary || ''}>{chat?.routing ? 'Assessing task difficulty…' : chat?.model ? `${chat.model}${chat.modelRoute?.tier ? ' · ' + chat.modelRoute.tier : ''}` : status.model || 'Connecting…'}</span>
+            <span id="model" className={chat?.routing ? 'routing' : ''} role="status" title={chat?.modelRoute?.reason || status.binary || ''}>{chat?.routing ? 'Choosing task model…' : chat?.model ? `${chat.model}${chat.modelRoute?.tier ? ' · ' + chat.modelRoute.tier : ''}` : status.model || 'Connecting…'}</span>
+            {!!status.models?.length && <label className="model-picker">Task model<select aria-label="Task model" value={draft.model || ''} disabled={busy} onChange={event => updateDraft({ model: event.target.value })}><option value="">Auto · {status.routingConfigured ? 'JEV' : 'Standard fallback'}</option>{status.models.map(item => <option key={item.model} value={item.model}>{item.displayName}</option>)}</select></label>}
           </header>
       <div id="messages" ref={messagesRef} aria-live="polite" onScroll={event => { const node = event.currentTarget; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; }}>
         {!items.length && <div className="empty"><div className="empty-orb" aria-hidden="true">✳</div><h1>{project ? 'A little help with your project?' : 'What shall we make today?'}</h1><p>{project ? 'Ask a question, explore an idea, or give Codex a task.' : 'Pick a conversation or start something new. Your ideas have room here.'}</p></div>}
         <div key={selected || 'new'}>{items.map((item, index) => <Message key={item.questionResponse ? 'answer:' + item.questionResponse.requestId : item.id ? item.role + ':' + item.id : 'message:' + index} item={item} onOpenImage={openImage} />)}
           {(chat?.pendingQuestions || []).map(request => <QuestionCard key={request.requestId} request={request} draft={questionDrafts[request.requestId]} onChange={(questionId, value) => setQuestionDrafts(previous => ({ ...previous, [request.requestId]: { ...previous[request.requestId], [questionId]: value } }))} onSubmit={answers => answerQuestions(chat.id, request.requestId, answers)} />)}
         </div>
-        {busy && !chat?.pendingQuestions?.length && <div className="waiting">{chat?.routing ? 'Assessing task difficulty before starting…' : 'Codex is working…'}</div>}
+        {busy && !chat?.pendingQuestions?.length && <div className="waiting">{chat?.routing ? 'Choosing a model before starting…' : 'Codex is working…'}</div>}
       </div>
       <footer><div id="error" role="alert">{error}</div>
         <div id="commands">{draft.commands.map((command, index) => <button type="button" className="command-chip" title="Remove command" key={index} onClick={() => updateDraft({ commands: draft.commands.filter((_, position) => position !== index) })}>$ {command} ×</button>)}</div>
