@@ -4,6 +4,8 @@ A minimal local chat UI for Codex, with a Node backend and Vite frontend. The ba
 
 ## Features
 
+- **Voice:** click **Mic** to dictate into the prompt, then **Stop mic** to review and send. Escape also stops dictation. The Mic button is hidden in browsers without speech recognition or on insecure pages. Recognition uses your browser language and requires a supported browser and microphone permission. Browser speech recognition may send audio to its speech service and require internet access; no audio is stored by this app.
+
 - **Interactive choices:** Codex can pause to ask questions. Pick an option (click or use arrow keys), switch your choice, or type your own answer, then click **Send answers** to continue the same turn.
 - **Working directory:** choose an existing folder for each new thread. To build beside this project, select its parent folder and ask Codex to create a new subfolder.
 - **Multiple threads:** create conversations and switch between them in the sidebar. History is saved locally across restarts.

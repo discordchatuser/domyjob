@@ -1,10 +1,12 @@
 import { activityFromMessage, outputPreview } from './activity.js';
 import { questionCard } from './questions.js';
 import './style.css';
+import { createVoice } from './voice.js';
 const $ = selector => document.querySelector(selector);
 let chats = [], selected = null, status = {}, inFlight = new Set();
 const drafts = new Map();
 let commandMode = false, commands = [];
+const voice = createVoice({ button: $('#dictate'), prompt: $('#prompt'), status: $('#voice-status'), error, onChange: saveDraft });
 function saveDraft() {
   if (selected) drafts.set(selected, { text: $('#prompt').value, commands: [...commands], commandMode });
 }
@@ -41,6 +43,7 @@ function render() {
     button.textContent = chat.title;
     button.className = chat.id === selected ? 'active' : '';
     button.onclick = () => {
+      voice.cancel();
       saveDraft();
       selected = chat.id; const draft = drafts.get(selected); $('#prompt').value = draft?.text || ''; commands = [...(draft?.commands || [])]; commandMode = draft?.commandMode || false; composer(); error(); render();
     };
@@ -50,6 +53,7 @@ function render() {
 
     remove.onclick = async () => {
       try {
+        if (selected === chat.id) voice.cancel();
         await api('/chats/' + chat.id, { method: 'DELETE' });
         chats = chats.filter(item => item.id !== chat.id); drafts.delete(chat.id); streams.delete(chat.id); inFlight.delete(chat.id);
         if (selected === chat.id) {
@@ -100,7 +104,8 @@ function render() {
     const label = document.createElement('span'); label.className = 'label'; label.textContent = { user: '›', assistant: '•', error: '!' }[item.role];
     const text = document.createElement('div'); text.className = 'text'; text.textContent = item.text;
     for (const command of item.commands || []) { const code = document.createElement('pre'); code.className = 'command-chip'; code.textContent = '$ ' + command; text.append(code); }
-    article.append(label, text); messages.append(article);
+    article.append(label, text);
+    messages.append(article);
   }
   for (const request of chat?.pendingQuestions || []) {
     messages.append(questionCard(request, async answers => {
@@ -116,6 +121,7 @@ function render() {
   $('#title').title = chat?.cwd || 'Default working directory';
 }
 async function newChat() {
+  voice.cancel();
   const chat = await api('/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: $('#workspace').value.trim() }) });
   saveDraft();
   chats.unshift(chat); selected = chat.id; $('#prompt').value = ''; commands = []; commandMode = false; composer(); render(); return chat;
@@ -124,6 +130,7 @@ $('#new').onclick = () => newChat().catch(e => error(e.message));
 $('#composer').onsubmit = async event => {
   event.preventDefault();
   if (!status.ready || inFlight.has(selected) || chats.find(chat => chat.id === selected)?.busy) return;
+  if (voice.listening) { voice.stop(); return; }
   if (commandMode) finishCommand();
   const prompt = $('#prompt').value.trim();
   const submittedCommands = [...commands];
@@ -167,12 +174,14 @@ $('#composer').onsubmit = async event => {
 document.addEventListener('keydown', event => {
   if ((event.metaKey || event.ctrlKey) && event.code === 'Period') {
     event.preventDefault();
+    voice.cancel();
     if (commandMode) finishCommand(); else {
       if ($('#prompt').value.trim()) return error('Add the command first, then write your message after pressing Escape.');
       commandMode = true; composer();
     }
     $('#prompt').focus();
   }
+  if (event.key === 'Escape' && voice.listening) { event.preventDefault(); voice.stop(); }
   if (event.key === 'Escape' && commandMode) { event.preventDefault(); finishCommand(); $('#prompt').focus(); }
 });
 composer();
