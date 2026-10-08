@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, stat, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -123,7 +123,11 @@ test('streams, persists, resumes and rejects overlapping turns', async () => {
     askQuestion = true;
     emitRouting = true;
     const interactive = await (await post(base + '/api/chats', { cwd: dataDir })).json();
-    assert.equal(interactive.cwd, dataDir);
+    assert.equal(interactive.orchestrator, true);
+    const duplicateProject = await (await post(base + '/api/chats', { cwd: dataDir })).json();
+    assert.equal(duplicateProject.id, interactive.id);
+    assert.equal((await (await fetch(base + '/api/chats')).json()).length, 1);
+    assert.equal(interactive.cwd, await realpath(dataDir));
     const interactiveResponse = await post(base + `/api/chats/${interactive.id}/messages`, { prompt: 'Build a todo app' });
     // Wait until the handler has consumed the question event and saved the thread id.
     for (let i = 0; i < 20; i++) {

@@ -82,6 +82,16 @@ test('React chat preserves choices and drafts, retries answers, streams replies,
   try {
     await act(async () => { root.render(React.createElement(App)); });
     assert.equal(document.querySelector('#model').textContent, 'Test model');
+    const schemePicker = document.querySelector('select[aria-label="Color scheme"]');
+    assert.equal(schemePicker.value, 'slate');
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, 'value').set.call(schemePicker, 'sand');
+      schemePicker.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+    });
+    assert.equal(document.querySelector('.app-shell').dataset.theme, 'sand');
+    assert.equal(window.localStorage.getItem('color-scheme'), 'sand');
+    assert.ok(document.querySelector('.composer-actions #send'));
+
     await click(document.querySelector('input[value="Bold"]'));
     assert.ok(document.querySelector('.question-card'));
     assert.equal(submissions.length, 0, 'selecting an option must not submit');
@@ -141,6 +151,66 @@ test('React chat preserves choices and drafts, retries answers, streams replies,
     await act(async () => root.unmount());
     globalThis.fetch = previousFetch;
     dom.window.close();
+    for (const [key, descriptor] of original) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; }
+  }
+});
+
+test('projects use one orchestrator, preserve drafts and leave thread controls to General', async () => {
+  const dom = new JSDOM('<div id="app"></div>', { url: 'http://localhost' });
+  const original = new Map();
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, navigator: dom.window.navigator, HTMLElement: dom.window.HTMLElement, IS_REACT_ACT_ENVIRONMENT: true })) {
+    original.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+  }
+  window.localStorage.setItem('color-scheme', 'midnight');
+  const previousFetch = globalThis.fetch;
+  const chats = [{ id: 'a', title: 'Trophy design', cwd: '/work/TROPHY', messages: [] }, { id: 'b', title: 'Other task', cwd: '/work/OTHER', messages: [] }];
+  let createdCwd;
+  globalThis.fetch = async (url, options) => {
+    if (url === '/api/status') return Response.json({ ready: true, model: 'Test' });
+    if (url === '/api/chats' && options?.method === 'POST') { createdCwd = JSON.parse(options.body).cwd; return Response.json({ id: 'new', title: 'New thread', cwd: createdCwd, messages: [] }); }
+    if (url === '/api/chats') return Response.json(chats);
+    if (url.includes('/project/content')) return Response.json({ documents: [], tasks: [], warnings: [] });
+    throw new Error('Unexpected request ' + url);
+  };
+  const React = await import('react');
+  const { createRoot } = await import('react-dom/client');
+  const { App } = await import('data:text/javascript;base64,' + Buffer.from(compiled.outputFiles[0].text).toString('base64'));
+  const root = createRoot(document.getElementById('app'));
+  const click = async node => { assert.ok(node); await React.act(async () => node.click()); };
+  try {
+    await React.act(async () => root.render(React.createElement(App)));
+    assert.equal(document.querySelector('.app-shell').dataset.theme, 'midnight');
+    assert.equal(document.querySelector('#threads'), null);
+    assert.equal(document.querySelector('#new'), null);
+    assert.equal(document.querySelector('#title').textContent, 'Project orchestrator');
+    const prompt = document.querySelector('#prompt');
+    await React.act(async () => { Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set.call(prompt, 'Keep draft'); prompt.dispatchEvent(new dom.window.Event('input', { bubbles: true })); });
+    const projectTab = name => [...document.querySelectorAll('[aria-label="Projects"] button')].find(node => node.textContent.includes(name));
+    await click(projectTab('OTHER'));
+    assert.equal(document.querySelector('#threads'), null);
+    assert.equal(document.querySelector('#prompt').value, '');
+    await click(projectTab('TROPHY'));
+    assert.equal(document.querySelector('#prompt').value, 'Keep draft');
+    await click([...document.querySelectorAll('[aria-label="Project views"] button')].find(node => node.textContent === 'Documents'));
+    assert.equal(document.querySelector('.document-workspace').hidden, false);
+    assert.equal(document.querySelector('.task-board').hidden, true);
+    assert.equal(document.querySelector('.chat-panel').hidden, true);
+    const chatTab = [...document.querySelectorAll('[aria-label="Project views"] button')].find(node => node.textContent === 'Chat');
+    await click(chatTab);
+    assert.equal(chatTab.getAttribute('aria-selected'), 'true');
+    assert.equal(document.querySelector('.chat-panel').hidden, false);
+    assert.equal(document.querySelector('.project-surface').hidden, true);
+    assert.equal(document.querySelector('#prompt').value, 'Keep draft');
+    assert.equal(document.querySelector('#new'), null);
+    assert.equal(createdCwd, undefined);
+    await click(projectTab('General'));
+    assert.ok(document.querySelector('#new'));
+    assert.ok(document.querySelector('#threads'));
+    await click(projectTab('TROPHY'));
+    assert.equal(document.querySelector('#prompt').value, 'Keep draft');
+  } finally {
+    await React.act(async () => root.unmount()); globalThis.fetch = previousFetch; dom.window.close();
     for (const [key, descriptor] of original) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; }
   }
 });

@@ -1,4 +1,6 @@
+import { ProjectPage } from './project-page.jsx';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { FolderBrowser, ProjectConsole } from './project.jsx';
 import { QuestionCard } from './questions.jsx';
 import { Gallery } from './gallery.jsx';
 import { Message } from './transcript.jsx';
@@ -13,11 +15,16 @@ async function api(path, options) {
 const post = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
 export default function App() {
+  const [scheme, setScheme] = useState(() => { try { const saved = window.localStorage.getItem('color-scheme'); return ['slate', 'midnight', 'sand'].includes(saved) ? saved : 'slate'; } catch { return 'slate'; } });
   const [chats, setChats] = useState([]);
   const [selected, setSelected] = useState(null);
   const [status, setStatus] = useState({});
   const [error, setError] = useState('');
   const [workspace, setWorkspace] = useState('');
+  const [browsing, setBrowsing] = useState(false);
+  const [view, setView] = useState('tasks');
+  const [project, setProject] = useState('');
+  const [loadedProjects, setLoadedProjects] = useState(() => { try { return JSON.parse(localStorage.getItem('projects') || '[]').filter(path => typeof path === 'string'); } catch { return []; } });
   const [drafts, setDrafts] = useState({});
   const [questionDrafts, setQuestionDrafts] = useState({});
   const [inFlight, setInFlight] = useState(new Set());
@@ -42,7 +49,7 @@ export default function App() {
     let mounted = true;
     Promise.all([api('/status'), api('/chats')]).then(([nextStatus, nextChats]) => {
       if (!mounted) return;
-      setStatus(nextStatus); setChats(nextChats); setSelected(nextChats[0]?.id || null);
+      setStatus(nextStatus); setChats(nextChats); setSelected((nextChats[0]?.cwd ? nextChats.find(item => item.cwd === nextChats[0].cwd && item.orchestrator) || nextChats.findLast(item => item.cwd === nextChats[0].cwd) : nextChats[0])?.id || null); setProject(nextChats[0]?.cwd || '');
       if (!nextStatus.ready) setError(nextStatus.error);
     }).catch(error => { if (mounted) setError(error.message); });
     return () => { mounted = false; for (const controller of controllers.current.values()) controller.abort(); };
@@ -66,7 +73,7 @@ export default function App() {
   useLayoutEffect(() => {
     const node = messagesRef.current;
     if (follow.current && node) node.scrollTop = node.scrollHeight;
-  }, [chats, selected, inFlight]);
+  }, [chats, selected, inFlight, view]);
 
   function finishCommand() {
     updateDraft({ text: '', commandMode: false, commands: draft.text.trim() ? [...draft.commands, draft.text.trim()] : draft.commands });
@@ -87,11 +94,17 @@ export default function App() {
     return () => document.removeEventListener('keydown', keydown);
   });
 
-  function chooseThread(id) { voice.cancel(); setGallery(null); setSelected(id); setError(''); }
-  async function createThread() {
-    const created = await api('/chats', post({ cwd: workspace.trim() }));
-    setChats(previous => [created, ...previous]);
-    chooseThread(created.id);
+  const projects = [...new Set([...loadedProjects, ...chats.map(item => item.cwd).filter(Boolean)])];
+  const projectThreads = chats.filter(item => (item.cwd || '') === project);
+  function chooseThread(id) { voice.cancel(); setGallery(null); setSelected(id); const target = chatsRef.current.find(item => item.id === id); if (target) setProject(target.cwd || ''); setError(''); }
+  const orchestratorFor = cwd => chatsRef.current.find(item => item.cwd === cwd && item.orchestrator) || chatsRef.current.findLast(item => item.cwd === cwd);
+  function chooseProject(cwd) { voice.cancel(); setGallery(null); setProject(cwd); setSelected((cwd ? orchestratorFor(cwd) : chatsRef.current.find(item => !item.cwd))?.id || null); setError(''); }
+  function rememberProject(cwd) { setLoadedProjects(previous => { const next = [...new Set([...previous, cwd])]; try { localStorage.setItem('projects', JSON.stringify(next)); } catch {} return next; }); }
+
+  async function createThread(cwd = project || workspace.trim()) {
+    const created = await api('/chats', post({ cwd }));
+    setChats(previous => [created, ...previous.filter(item => item.id !== created.id)]);
+    chooseThread(created.id); setProject(created.cwd || ''); setView('chat');
     return created;
   }
   async function newThread() {
@@ -109,7 +122,7 @@ export default function App() {
       const remaining = chatsRef.current.filter(item => item.id !== id);
       setChats(previous => previous.filter(item => item.id !== id));
       setDrafts(previous => { const next = { ...previous }; delete next[id]; return next; });
-      if (selectedRef.current === id) chooseThread(remaining[0]?.id || null);
+      if (selectedRef.current === id) chooseThread(remaining.find(item => (item.cwd || '') === project)?.id || null);
       setError('');
     } catch (error) { setError(error.message); }
   }
@@ -168,19 +181,30 @@ export default function App() {
     }
   }
   const openImage = imageId => setGallery({ chatId: selected, imageId });
-  return <>
-    <aside><div className="brand">◈ <strong>Local Codex</strong></div>
-      <button id="new" onClick={newThread} disabled={creating}>＋ New thread</button>
-      <label className="workspace">Working directory for new threads<input id="workspace" placeholder="Default project folder" aria-label="Working directory for new threads" value={workspace} onChange={event => setWorkspace(event.target.value)} /></label>
-      <nav id="threads" aria-label="Threads">{chats.map(item => <div className="thread-row" key={item.id}><button className={item.id === selected ? 'active' : ''} onClick={() => chooseThread(item.id)}>{item.title}</button><button className="delete-thread" title="Delete thread" aria-label={'Delete ' + item.title} onClick={() => deleteThread(item.id)}>×</button></div>)}</nav>
-      <div className="local">On your machine</div>
-    </aside>
-    <main><header><span id="title" title={chat?.cwd || 'Default working directory'}>{chat?.title || 'New conversation'}</span>
-      <button id="gallery" type="button" hidden={!chat?.images?.length} onClick={() => openImage()}>Images ({chat?.images?.length || 0})</button>
-      <span id="model" className={chat?.routing ? 'routing' : ''} role="status" title={chat?.modelRoute?.reason || status.binary || ''}>{chat?.routing ? 'Assessing task difficulty…' : chat?.model ? `${chat.model}${chat.modelRoute?.tier ? ' · ' + chat.modelRoute.tier : ''}` : status.model || 'Connecting…'}</span>
-    </header>
+  return <div className="app-shell" data-theme={scheme}>
+    <div className="project-tabs-bar"><div className="brand">◈ <strong>Local Codex</strong></div>
+      <div className="project-tabs" role="tablist" aria-label="Projects"><button role="tab" aria-selected={!project} onClick={() => chooseProject('')}>General</button>{projects.map(cwd => <button role="tab" key={cwd} title={cwd} aria-selected={project === cwd} onClick={() => chooseProject(cwd)}><span>◇</span> {cwd.split('/').filter(Boolean).at(-1)}</button>)}</div>
+      <button className="load-project" onClick={() => setBrowsing(true)}>＋ Load project</button>
+      <label className="scheme-picker"><span>Appearance</span><select aria-label="Color scheme" value={scheme} onChange={event => { const next = event.target.value; setScheme(next); try { window.localStorage.setItem('color-scheme', next); } catch {} }}><option value="slate">Slate</option><option value="midnight">Midnight</option><option value="sand">Sand</option></select></label>
+    </div>
+    <main className={project ? 'has-project' : 'general-workspace'}>
+      {project && <><header className="workspace-header"><div><strong>{project.split('/').filter(Boolean).at(-1)}</strong><small>{project}</small></div>
+        <div className="view-tabs" role="tablist" aria-label="Project views">{[['tasks', 'Tasks'], ['docs', 'Documents'], ['terminal', 'Terminal'], ['chat', 'Chat']].map(([key, title]) => <button role="tab" key={key} aria-selected={view === key} onClick={() => setView(key)}>{title}{key === 'chat' && busy ? ' •' : ''}</button>)}</div>
+      </header></>}
+      <div className={'work-area' + (project && view === 'chat' ? ' chat-workspace' : '')}>
+        {project && <div className="project-surface" hidden={view === 'chat'}><div hidden={view === 'terminal'} className="project-content-slot"><ProjectPage key={project} cwd={project} section={view} onSectionChange={setView} /></div><div hidden={view !== 'terminal'} className="terminal-slot">{view === 'terminal' && <ProjectConsole key={project} cwd={project} expanded />}</div></div>}
+        <section className="chat-panel" hidden={!!project && view !== 'chat'} aria-label={project ? 'Project chat' : 'General chat'}>
+          {!project && <div className="thread-navigation">
+          <div className="chat-heading"><strong>{project ? 'Project chat' : 'Conversations'}</strong><button id="new" onClick={newThread} disabled={creating}>＋ New thread</button></div>
+          <nav id="threads" aria-label="Threads">{projectThreads.map(item => <div className="thread-row" key={item.id}><button className={item.id === selected ? 'active' : ''} onClick={() => chooseThread(item.id)}>{item.busy ? '• ' : ''}{item.title}</button><button className="delete-thread" title="Delete thread" aria-label={'Delete ' + item.title} onClick={() => deleteThread(item.id)}>×</button></div>)}</nav>
+          {!project && <details className="workspace-options"><summary>Working directory</summary><label className="workspace">Working directory for new threads<input id="workspace" placeholder="Default project folder" aria-label="Working directory for new threads" value={workspace} onChange={event => setWorkspace(event.target.value)} /></label></details>}
+          </div>}
+          <header className="chat-meta"><span id="title" title={chat?.cwd || 'Default working directory'}>{project ? 'Project orchestrator' : chat?.title || 'New conversation'}</span>
+            <button id="gallery" type="button" hidden={!chat?.images?.length} onClick={() => openImage()}>Images ({chat?.images?.length || 0})</button>
+            <span id="model" className={chat?.routing ? 'routing' : ''} role="status" title={chat?.modelRoute?.reason || status.binary || ''}>{chat?.routing ? 'Assessing task difficulty…' : chat?.model ? `${chat.model}${chat.modelRoute?.tier ? ' · ' + chat.modelRoute.tier : ''}` : status.model || 'Connecting…'}</span>
+          </header>
       <div id="messages" ref={messagesRef} aria-live="polite" onScroll={event => { const node = event.currentTarget; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; }}>
-        {!items.length && <div className="empty"><h1>› What are we working on?</h1><p>Start a thread and send a prompt to your local Codex.</p></div>}
+        {!items.length && <div className="empty"><div className="empty-orb" aria-hidden="true">✳</div><h1>{project ? 'A little help with your project?' : 'What shall we make today?'}</h1><p>{project ? 'Ask a question, explore an idea, or give Codex a task.' : 'Pick a conversation or start something new. Your ideas have room here.'}</p></div>}
         <div key={selected || 'new'}>{items.map((item, index) => <Message key={item.questionResponse ? 'answer:' + item.questionResponse.requestId : item.id ? item.role + ':' + item.id : 'message:' + index} item={item} onOpenImage={openImage} />)}
           {(chat?.pendingQuestions || []).map(request => <QuestionCard key={request.requestId} request={request} draft={questionDrafts[request.requestId]} onChange={(questionId, value) => setQuestionDrafts(previous => ({ ...previous, [request.requestId]: { ...previous[request.requestId], [questionId]: value } }))} onSubmit={answers => answerQuestions(chat.id, request.requestId, answers)} />)}
         </div>
@@ -188,18 +212,28 @@ export default function App() {
       </div>
       <footer><div id="error" role="alert">{error}</div>
         <div id="commands">{draft.commands.map((command, index) => <button type="button" className="command-chip" title="Remove command" key={index} onClick={() => updateDraft({ commands: draft.commands.filter((_, position) => position !== index) })}>$ {command} ×</button>)}</div>
-        <div id="mode">{draft.commandMode ? 'Command · Esc to add' : 'Cmd+. to add a command'}</div>
+        {draft.commandMode && <div id="mode">Command · Esc to attach</div>}
         <div id="voice-status" role="status" aria-live="polite">{voice.status}</div>
         <form id="composer" className={draft.commandMode ? 'command-mode' : ''} onSubmit={send}>
-          <textarea id="prompt" ref={promptRef} rows="2" aria-label="Prompt" placeholder={draft.commandMode ? 'npm run dev' : 'Ask Codex anything…'} value={draft.text} readOnly={voice.listening} onChange={event => updateDraft({ text: event.target.value })} onKeyDown={event => {
+          <textarea id="prompt" ref={promptRef} rows="3" aria-label="Prompt" placeholder={draft.commandMode ? 'Type a command…' : project ? 'Message your project orchestrator…' : 'What’s on your mind?'} value={draft.text} readOnly={voice.listening} onChange={event => updateDraft({ text: event.target.value })} onKeyDown={event => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form.requestSubmit(); }
           }} />
+          <div className="composer-actions"><span className="composer-hint">{draft.commandMode ? 'Command' : 'Shift + Enter for a new line'}</span>
           <button id="dictate" type="button" hidden={!voice.available} disabled={!voice.available} title="Dictate a message (microphone permission required)" aria-pressed={voice.listening} onClick={voice.toggle}>{voice.listening ? 'Stop mic' : 'Mic'}</button>
           <button id="send" type="submit" disabled={!status.ready || busy || creating}>Send ↑</button>
+          </div>
         </form>
-        <p>Enter to send · Shift + Enter for a new line · Cmd+. for commands</p>
+        <p className="composer-shortcuts">Enter to send · Cmd+. to attach a command</p>
       </footer>
+        </section>
+      </div>
     </main>
+    {browsing && <FolderBrowser initialPath={project || workspace} onClose={() => setBrowsing(false)} onLoad={async cwd => {
+      setCreating(true);
+      try { rememberProject(cwd); const existing = chatsRef.current.find(item => item.cwd === cwd); if (existing) chooseProject(cwd); else await createThread(cwd); setWorkspace(cwd); setView('tasks'); setBrowsing(false); }
+      catch (error) { setError(error.message); }
+      finally { setCreating(false); }
+    }} />}
     {gallery?.chatId === selected && chat?.images?.length > 0 && <Gallery key={gallery.chatId + ':' + (gallery.imageId || '')} images={chat.images} imageId={gallery.imageId} onClose={() => setGallery(null)} />}
-  </>;
+  </div>;
 }

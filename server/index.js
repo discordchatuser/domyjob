@@ -13,7 +13,7 @@ async function shutdown() {
   stopping = true;
   server.close();
   const timeout = setTimeout(() => process.exit(1), 10000);
-  try { if (codexPromise) await (await codexPromise).close(); }
+  try { await server.closeProjects(); if (codexPromise) await (await codexPromise).close(); }
   catch (error) { console.error(error.message); }
   finally { clearTimeout(timeout); process.exit(0); }
 }

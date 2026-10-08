@@ -25,13 +25,15 @@ test('adapts streamed messages and interrupts before cleaning and deleting', asy
   const rpc = new FakeRpc();
   const client = createClient(rpc, { cwd: '/workspace', routing: false });
   const controller = new AbortController();
-  const { events } = await client.start().runStreamed('Hello', { signal: controller.signal });
+  const { events } = await client.start().runStreamed('Hello', { signal: controller.signal, orchestrator: true });
   const seen = [];
   for await (const event of events) {
     seen.push(event);
     if (event.type === 'item.updated') controller.abort();
   }
   assert.equal(seen[0].thread_id, 'thread-1');
+  assert.match(rpc.calls[0].params.developerInstructions, /persistent main orchestrator/);
+  assert.match(rpc.calls[0].params.developerInstructions, /spawn and manage subagents/);
   assert.equal(seen.find(event => event.type === 'item.updated').item.text, 'Hello');
   await client.deleteThread('thread-1');
   assert.deepEqual(rpc.calls.map(call => call.method), ['thread/start', 'turn/start', 'turn/interrupt', 'thread/backgroundTerminals/clean', 'thread/delete']);
@@ -120,4 +122,27 @@ test('adapts generated, viewed and MCP images', async () => {
   assert.equal(seen[0].base64, 'base64-image');
   assert.equal(seen[1].source, '/tmp/image.png');
   assert.equal(seen[2].references[0].base64, 'mcp-base64');
+});
+
+test('orchestrator exposes subagent spawn and result activity in the transcript', async () => {
+  const rpc = new FakeRpc();
+  const baseRequest = rpc.request.bind(rpc);
+  rpc.request = async (method, params) => {
+    if (method !== 'turn/start') return baseRequest(method, params);
+    rpc.calls.push({ method, params });
+    queueMicrotask(() => {
+      for (const [id, tool, agentsStates] of [['spawn', 'spawnAgent', { worker: { status: 'running' } }], ['wait', 'wait', { worker: { status: 'completed', message: 'Tests pass' } }]]) {
+        rpc.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', item: { id, type: 'collabAgentToolCall', tool, prompt: 'Implement bounded task', receiverThreadIds: ['worker'], agentsStates, status: 'completed' } } });
+      }
+      rpc.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+    });
+    return { turn: { id: 'turn-1' } };
+  };
+  const client = createClient(rpc, { routing: false });
+  const { events } = await client.start('/project').runStreamed('Implement feature', { orchestrator: true });
+  const activities = [];
+  for await (const event of events) if (event.item?.type === 'activity') activities.push(event.item);
+  assert.equal(activities[0].label, 'Spawned subagent');
+  assert.match(activities[1].output, /worker: completed\nTests pass/);
+  assert.equal(rpc.listenerCount('notification'), 0);
 });

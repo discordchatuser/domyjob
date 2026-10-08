@@ -6,7 +6,7 @@ export class CodexRpc extends EventEmitter {
   constructor(binary) {
     super();
     this.pending = new Map(); this.nextId = 1; this.failure = null;
-    this.child = spawn(binary, ['app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.child = spawn(binary, ['app-server', '--enable', 'multi_agent', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
     this.child.stderr.on('data', data => { stderr = (stderr + data).slice(-4000); });
     this.lines = createInterface({ input: this.child.stdout });

@@ -6,6 +6,8 @@ import { constants } from 'node:fs';
 import { delimiter, resolve } from 'node:path';
 import { loadRoutingSkill, routingPrompt, routingSchema, chooseRoute } from './model-route.js';
 
+const orchestratorInstructions = 'You are the persistent main orchestrator for this project. Keep project context, decisions, task progress and integration in this conversation. The user authorizes you to spawn and manage subagents as needed using the available collaboration tools. Delegate bounded work when useful, assign clear ownership, monitor progress, integrate results and verify the final outcome. Tell workers they share the codebase and must preserve others edits. Do not create replacement top-level project conversations. Handle small tasks directly; do not delegate just for appearances. Report delegation and material results clearly to the user. If collaboration tools are unavailable, report that limitation and continue useful work yourself.';
+
 const questionInstructions = 'This chat UI supports interactive question cards through the ask_user tool. Whenever you need clarification or the user asks you to ask questions (including retrying failed questions), call ask_user with concise selectable options. Do not replace the tool call with a numbered list of questions or tell the user to answer directly in chat. ask_user works in Default mode; do not use the Plan-mode-only request_user_input tool. For requests to build an app, ask about meaningful product or design choices before implementing. After answers, continue implementation; do not stay in planning mode.';
 
 export async function findCodex() {
@@ -24,10 +26,10 @@ export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
   const pendingQuestions = new Map();
   const options = { cwd, approvalPolicy: 'never', sandbox: 'workspace-write', ...(model ? { model } : {}) };
   function thread(existingId, workdir = cwd) {
-    return { async runStreamed(prompt, { signal } = {}) {
+    return { async runStreamed(prompt, { signal, orchestrator = false } = {}) {
       return { events: (async function* () {
         const skill = routing ? await loadRoutingSkill() : null;
-        const instructions = questionInstructions + (skill ? '\nBefore every user task, the application runs a ROUTING PREFLIGHT ONLY turn. During that turn, only classify difficulty as requested and return the required JSON; do not ask questions or perform the task. During the execution turn, the routing decision has already been applied; proceed with the task.\n\n' + skill.instructions : '');
+        const instructions = questionInstructions + (orchestrator ? '\n\n' + orchestratorInstructions : '') + (skill ? '\nBefore every user task, the application runs a ROUTING PREFLIGHT ONLY turn. During that turn, only classify difficulty as requested and return the required JSON; do not ask questions or perform the task. During the execution turn, the routing decision has already been applied; proceed with the task.\n\n' + skill.instructions : '');
         const result = await rpc.request(existingId ? 'thread/resume' : 'thread/start', { ...options, cwd: workdir, developerInstructions: instructions, ...(existingId ? { threadId: existingId } : { dynamicTools: [askUserTool] }) });
         const threadId = result.thread.id;
         loaded.add(threadId);
@@ -53,6 +55,11 @@ export function createClient(rpc, { binary, cwd, model, routing = true } = {}) {
             const references = (item.result?.content || []).filter(content => content.type === 'image' && typeof content.data === 'string').map(content => ({ source: '', base64: content.data, name: item.tool + ' image' }));
             if (references.length) return { id: item.id, type: 'image', references };
             return { id: item.id, type: 'activity', label: 'Called ' + item.server + '/' + item.tool, output: item.error?.message || '', status: item.status };
+          }
+          if (item.type === 'collabAgentToolCall') {
+            const labels = { spawnAgent: 'Spawned subagent', sendInput: 'Directed subagent', resumeAgent: 'Resumed subagent', wait: 'Waiting for subagents', closeAgent: 'Closed subagent' };
+            const states = Object.entries(item.agentsStates || {}).map(([id, state]) => id + ': ' + state.status + (state.message ? '\n' + state.message : ''));
+            return { id: item.id, type: 'activity', label: labels[item.tool] || 'Subagent activity', output: [item.prompt, ...states].filter(Boolean).join('\n\n'), status: item.status === 'inProgress' ? 'in_progress' : item.status };
           }
           if (item.type === 'commandExecution') return { id: item.id, type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput || '', exit_code: item.exitCode, status: item.status, duration_ms: item.durationMs };
         };

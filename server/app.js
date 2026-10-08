@@ -1,6 +1,9 @@
+import { migrateProjectChats, projectOrchestrator } from './project-chats.js';
+import { projectContent, readDocument } from './project-content.js';
+import { browseFolders, projectInfo, projectServers } from './projects.js';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { readFile, mkdir, rename, writeFile, stat } from 'node:fs/promises';
+import { readFile, mkdir, rename, writeFile, stat, realpath } from 'node:fs/promises';
 import { imageStore, imageReferences } from './images.js';
 import { resolve, extname } from 'node:path';
 
@@ -11,6 +14,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
   let chats;
   try { chats = JSON.parse(await readFile(file, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; chats = []; }
+  const servers = projectServers();
   const running = new Map();
   const deleting = new Set();
   const questions = new Map();
@@ -28,14 +32,46 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
     });
     return saves;
   }
+  let canonicalized = false;
+  for (const chat of chats) {
+    if (!chat.cwd) continue;
+    try { const cwd = await realpath(chat.cwd); if (cwd !== chat.cwd) { chat.cwd = cwd; canonicalized = true; } } catch {}
+  }
+  if (migrateProjectChats(chats) || canonicalized) await save();
   const summary = chat => ({ ...chat, busy: running.has(chat.id), pendingQuestions: questions.get(chat.id) || [] });
-  return createServer(async (req, res) => {
+  const server = createServer(async (req, res) => {
     const json = (status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
     try {
       const pathname = new URL(req.url, 'http://localhost').pathname;
       if (req.method !== 'GET') {
         const origin = req.headers.origin;
         if (origin && !['http://127.0.0.1:5173', 'http://localhost:5173', 'http://127.0.0.1:3001', 'http://localhost:3001'].includes(origin)) return json(403, { error: 'Origin not allowed' });
+      }
+      if (pathname === '/api/folders' && req.method === 'GET') {
+        try { return json(200, await browseFolders(new URL(req.url, 'http://localhost').searchParams.get('path'))); }
+        catch (error) { return json(400, { error: error.message }); }
+      }
+      if (req.method === 'GET' && ['/api/project/content', '/api/project/document'].includes(pathname)) {
+        try {
+          const params = new URL(req.url, 'http://localhost').searchParams;
+          if (pathname.endsWith('/content')) return json(200, await projectContent(params.get('path')));
+          const document = await readDocument(params.get('path'), params.get('file'));
+          res.writeHead(200, { 'Content-Type': document.type, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
+          res.end(document.bytes); return;
+        } catch (error) { return json(400, { error: error.message }); }
+      }
+      if (pathname === '/api/project' && req.method === 'GET') {
+        try { return json(200, await projectInfo(new URL(req.url, 'http://localhost').searchParams.get('path'))); }
+        catch (error) { return json(400, { error: error.message }); }
+      }
+      if (pathname === '/api/project/server') {
+        try {
+          if (req.method === 'GET') return json(200, await servers.get(new URL(req.url, 'http://localhost').searchParams.get('path')));
+          const input = await readJson(req);
+          if (typeof input.cwd !== 'string' || !input.cwd.trim()) return json(400, { error: 'Select a project folder' });
+          if (req.method === 'POST') return json(200, await servers.start(input.cwd, input.command));
+          if (req.method === 'DELETE') return json(200, await servers.stop(input.cwd));
+        } catch (error) { return json(400, { error: error.message }); }
       }
       if (req.method === 'GET' && pathname === '/api/status') {
         try { const codex = await getCodex(); return json(200, { ready: true, binary: codex.binary, model: codex.model }); }
@@ -46,9 +82,10 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
         let input;
         try { input = await readJson(req); } catch { return json(400, { error: 'Invalid request' }); }
         if (input.cwd !== undefined && typeof input.cwd !== 'string') return json(400, { error: 'Invalid working directory' });
-        const cwd = input.cwd?.trim() ? resolve(input.cwd.trim()) : undefined;
-        if (cwd) { try { if (!(await stat(cwd)).isDirectory()) throw new Error(); } catch { return json(400, { error: 'Working directory must be an existing folder' }); } }
-        const chat = { id: randomUUID(), threadId: null, title: 'New thread', messages: [], ...(cwd ? { cwd } : {}) };
+        let cwd = input.cwd?.trim() ? resolve(input.cwd.trim()) : undefined;
+        if (cwd) { try { if (!(await stat(cwd)).isDirectory()) throw new Error(); cwd = await realpath(cwd); } catch { return json(400, { error: 'Working directory must be an existing folder' }); } }
+        if (cwd) { const existing = projectOrchestrator(chats, cwd); if (existing) return json(200, summary(existing)); }
+        const chat = { id: randomUUID(), threadId: null, title: 'New thread', messages: [], ...(cwd ? { cwd, orchestrator: true, archivedProjectThread: false } : {}) };
         chats.unshift(chat); await save(); return json(201, summary(chat));
       }
       const imageRoute = pathname.match(/^\/api\/chats\/([^/]+)\/images\/([a-f0-9]{64}\.(?:png|jpg|gif|webp))$/);
@@ -134,7 +171,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           if (controller.signal.aborted) { res.end(); return; }
           send({ type: 'chat', chat: summary(chat) });
           try {
-            const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal });
+            const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal, orchestrator: Boolean(chat.orchestrator) });
             for await (const event of events) {
               if (event.type === 'model.routing') {
                 chat.routing = true; send(event);
@@ -206,4 +243,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
       else json(500, { error: error.code === 'ENOENT' ? 'Run npm run dev, or npm run build first.' : error.message });
     }
   });
+  server.closeProjects = () => servers.close();
+  server.on('close', () => { servers.close().catch(console.error); });
+  return server;
 }
