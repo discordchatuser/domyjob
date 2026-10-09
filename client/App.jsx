@@ -36,12 +36,16 @@ export default function App() {
   const active = useRef(new Set());
   const controllers = useRef(new Map());
   const promptRef = useRef(null);
+  const promptHistory = useRef(new Map());
   const messagesRef = useRef(null);
   const follow = useRef(true);
   const chat = chats.find(item => item.id === selected);
   const draftKey = selected || 'new';
   const draft = drafts[draftKey] || emptyDraft();
-  const updateDraft = useCallback(patch => setDrafts(previous => ({ ...previous, [draftKey]: { ...(previous[draftKey] || emptyDraft()), ...patch } })), [draftKey]);
+  const updateDraft = useCallback(patch => {
+    if (Object.hasOwn(patch, 'text')) promptHistory.current.delete(draftKey);
+    setDrafts(previous => ({ ...previous, [draftKey]: { ...(previous[draftKey] || emptyDraft()), ...patch } }));
+  }, [draftKey]);
   const voice = useVoice({ value: draft.text, onChange: text => updateDraft({ text }), onError: setError, onFocus: () => promptRef.current?.focus() });
   const busy = inFlight.has(selected) || chat?.busy;
   const items = [...(chat?.messages || []), ...Object.values(chat?.stream || {})];
@@ -145,10 +149,12 @@ export default function App() {
       const target = chat || await createThread(); id = target.id;
       active.current.add(id); setInFlight(new Set(active.current));
       const controller = new AbortController(); controllers.current.set(id, controller);
+      promptHistory.current.delete(draftKey);
+      promptHistory.current.delete(id);
       setDrafts(previous => ({ ...previous, [id]: emptyDraft(), ...(chat ? {} : { new: emptyDraft() }) }));
       setError('');
       setChats(previous => previous.map(item => item.id === id ? { ...item, stream: {}, messages: [...item.messages, { role: 'user', text, commands }] } : item));
-      const response = await fetch(`/api/chats/${id}/messages`, { ...post({ prompt: text, commands, ...(draft.model ? { model: draft.model } : {}) }), signal: controller.signal });
+      const response = await fetch(`/api/chats/${id}/messages`, { ...post({ prompt: text, commands, ...(!target.orchestrator && !project && draft.model ? { model: draft.model } : {}) }), signal: controller.signal });
       if (!response.ok) throw new Error((await response.json()).error || 'Request failed');
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '', doneReceived = false;
       function handle(line) {
@@ -181,20 +187,59 @@ export default function App() {
       setCreating(false);
     }
   }
+  function handleTaskExecutionEvent(chatId, event) {
+    if (event.type === 'chat') {
+      active.current.add(chatId); setInFlight(new Set(active.current));
+      if (event.chat.cwd === project) setSelected(chatId);
+    }
+    if (event.type === 'done' || event.type === 'execution.finished') {
+      active.current.delete(chatId); setInFlight(new Set(active.current));
+    }
+    if (event.type === 'error') setError(event.error);
+    setChats(previous => {
+      if (event.type === 'execution.finished') return previous.map(item => item.id === chatId ? { ...item, busy: false } : item);
+      if (event.type === 'chat' && !previous.some(item => item.id === chatId)) return [applyStreamEvent({ messages: [], stream: {} }, event), ...previous];
+      return previous.map(item => item.id === chatId ? applyStreamEvent(item, event) : item);
+    });
+  }
+  function browsePromptHistory(event) {
+    if (!['ArrowUp', 'ArrowDown'].includes(event.key) || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.nativeEvent.isComposing || event.currentTarget.readOnly || draft.commandMode) return;
+    const input = event.currentTarget;
+    if (input.selectionStart !== input.selectionEnd) return;
+    let history = promptHistory.current.get(draftKey);
+    if (!history) {
+      if (event.key !== 'ArrowUp' || input.value.slice(0, input.selectionStart).includes('\n')) return;
+      const entries = (chat?.messages || []).filter(message => message.role === 'user' && !message.questionResponse && typeof message.text === 'string' && message.text.trim()).map(message => message.text);
+      if (!entries.length) return;
+      history = { entries, cursor: entries.length, draft: draft.text };
+      promptHistory.current.set(draftKey, history);
+    }
+    event.preventDefault();
+    history.cursor = Math.max(0, Math.min(history.entries.length, history.cursor + (event.key === 'ArrowUp' ? -1 : 1)));
+    const text = history.cursor === history.entries.length ? history.draft : history.entries[history.cursor];
+    setDrafts(previous => ({ ...previous, [draftKey]: { ...(previous[draftKey] || emptyDraft()), text } }));
+    if (history.cursor === history.entries.length) promptHistory.current.delete(draftKey);
+  }
   const openImage = imageId => setGallery({ chatId: selected, imageId });
   return <div className="app-shell" data-theme={scheme}>
-    <div className="project-tabs-bar"><div className="brand">◈ <strong>Local Codex</strong></div>
+    <header className="project-tabs-bar"><div className="brand">◈ <strong>Local Codex</strong></div>
       <div className="project-tabs" role="tablist" aria-label="Projects"><button role="tab" aria-selected={!project} onClick={() => chooseProject('')}>General</button>{projects.map(cwd => <button role="tab" key={cwd} title={cwd} aria-selected={project === cwd} onClick={() => chooseProject(cwd)}><span>◇</span> {cwd.split('/').filter(Boolean).at(-1)}</button>)}</div>
       <button className="load-project" onClick={() => setBrowsing(true)}>＋ Load project</button>
-      <button aria-pressed={view === 'usage'} onClick={() => setView(view === 'usage' ? 'chat' : 'usage')}>Usage</button><label className="scheme-picker"><span>Appearance</span><select aria-label="Color scheme" value={scheme} onChange={event => { const next = event.target.value; setScheme(next); try { window.localStorage.setItem('color-scheme', next); } catch {} }}><option value="slate">Slate</option><option value="midnight">Midnight</option><option value="sand">Sand</option></select></label>
-    </div>
+      <button aria-pressed={view === 'usage'} onClick={() => setView(view === 'usage' ? 'chat' : 'usage')}>Usage</button><label className="scheme-picker"><select aria-label="Color scheme" value={scheme} onChange={event => { const next = event.target.value; setScheme(next); try { window.localStorage.setItem('color-scheme', next); } catch {} }}><option value="slate">Slate</option><option value="midnight">Midnight</option><option value="sand">Sand</option></select></label>
+    </header>
     <main className={project ? 'has-project' : 'general-workspace'}>
-      {project && <><header className="workspace-header"><div><strong>{project.split('/').filter(Boolean).at(-1)}</strong><small>{project}</small></div>
-        <div className="view-tabs" role="tablist" aria-label="Project views">{[['tasks', 'Tasks'], ['docs', 'Documents'], ['terminal', 'Terminal'], ['chat', 'Chat'], ['usage', 'Usage']].map(([key, title]) => <button role="tab" key={key} aria-selected={view === key} onClick={() => setView(key)}>{title}{key === 'chat' && busy ? ' •' : ''}</button>)}</div>
-      </header></>}
+      {project && <aside className="workspace-sidebar" aria-label="Project navigation">
+        <div className="sidebar-heading" title={project}>Workspace</div>
+        <nav className="workspace-navigation" role="tablist" aria-label="Project views" aria-orientation="vertical">{[['tasks', 'Tasks'], ['docs', 'Documents'], ['terminal', 'Terminal'], ['chat', 'Chat']].map(([key, title], index, views) => <button role="tab" key={key} aria-selected={view === key} onClick={() => setView(key)} onKeyDown={event => {
+          if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? views.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + views.length) % views.length;
+          event.currentTarget.parentElement.children[next].focus(); setView(views[next][0]);
+        }}>{title}{key === 'chat' && busy ? <span className="sidebar-running" aria-label="Running">•</span> : null}</button>)}</nav>
+      </aside>}
       <div className={'work-area' + (project && view === 'chat' ? ' chat-workspace' : '')}>
         {view === 'usage' && <UsagePage key={project} project={project} />}
-        {project && <div className="project-surface" hidden={view === 'chat' || view === 'usage'}><div hidden={view === 'terminal'} className="project-content-slot"><ProjectPage key={project} cwd={project} section={view} onSectionChange={setView} /></div><div hidden={view !== 'terminal'} className="terminal-slot">{view === 'terminal' && <ProjectConsole key={project} cwd={project} expanded />}</div></div>}
+        {project && <div className="project-surface" hidden={view === 'chat' || view === 'usage'}><div hidden={view === 'terminal'} className="project-content-slot"><ProjectPage key={project} cwd={project} section={view} onSectionChange={setView} onExecutionEvent={handleTaskExecutionEvent} active={view === 'tasks' || view === 'docs'} contentVersion={chat?.messages.filter(item => item.role === 'activity' && item.label?.startsWith('Called project_tasks/')).length || 0} /></div><div hidden={view !== 'terminal'} className="terminal-slot">{view === 'terminal' && <ProjectConsole key={project} cwd={project} expanded />}</div></div>}
         <section className="chat-panel" hidden={view === 'usage' || (!!project && view !== 'chat')} aria-label={project ? 'Project chat' : 'General chat'}>
           {!project && <div className="thread-navigation">
           <div className="chat-heading"><strong>{project ? 'Project chat' : 'Conversations'}</strong><button id="new" onClick={newThread} disabled={creating}>＋ New thread</button></div>
@@ -204,7 +249,7 @@ export default function App() {
           <header className="chat-meta"><span id="title" title={chat?.cwd || 'Default working directory'}>{project ? 'Project orchestrator' : chat?.title || 'New conversation'}</span>
             <button id="gallery" type="button" hidden={!chat?.images?.length} onClick={() => openImage()}>Images ({chat?.images?.length || 0})</button>
             <span id="model" className={chat?.routing ? 'routing' : ''} role="status" title={chat?.modelRoute?.reason || status.binary || ''}>{chat?.routing ? 'Choosing task model…' : chat?.model ? `${chat.model}${chat.modelRoute?.tier ? ' · ' + chat.modelRoute.tier : ''}` : status.model || 'Connecting…'}</span>
-            {!!status.models?.length && <label className="model-picker">Task model<select aria-label="Task model" value={draft.model || ''} disabled={busy} onChange={event => updateDraft({ model: event.target.value })}><option value="">Auto · {status.routingConfigured ? 'JEV' : 'Standard fallback'}</option>{status.models.map(item => <option key={item.model} value={item.model}>{item.displayName}</option>)}</select></label>}
+            {!project && !chat?.orchestrator && !!status.models?.length && <label className="model-picker">Task model<select aria-label="Task model" value={draft.model || ''} disabled={busy} onChange={event => updateDraft({ model: event.target.value })}><option value="">Auto · {status.routingConfigured ? 'JEV' : 'Standard fallback'}</option>{status.models.map(item => <option key={item.model} value={item.model}>{item.displayName}</option>)}</select></label>}
           </header>
       <div id="messages" ref={messagesRef} aria-live="polite" onScroll={event => { const node = event.currentTarget; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; }}>
         {!items.length && <div className="empty"><div className="empty-orb" aria-hidden="true">✳</div><h1>{project ? 'A little help with your project?' : 'What shall we make today?'}</h1><p>{project ? 'Ask a question, explore an idea, or give Codex a task.' : 'Pick a conversation or start something new. Your ideas have room here.'}</p></div>}
@@ -220,6 +265,7 @@ export default function App() {
         <form id="composer" className={draft.commandMode ? 'command-mode' : ''} onSubmit={send}>
           <textarea id="prompt" ref={promptRef} rows="3" aria-label="Prompt" placeholder={draft.commandMode ? 'Type a command…' : project ? 'Message your project orchestrator…' : 'What’s on your mind?'} value={draft.text} readOnly={voice.listening} onChange={event => updateDraft({ text: event.target.value })} onKeyDown={event => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form.requestSubmit(); }
+            browsePromptHistory(event);
           }} />
           <div className="composer-actions"><span className="composer-hint">{draft.commandMode ? 'Command' : 'Shift + Enter for a new line'}</span>
           <button id="dictate" type="button" hidden={!voice.available} disabled={!voice.available} title="Dictate a message (microphone permission required)" aria-pressed={voice.listening} onClick={voice.toggle}>{voice.listening ? 'Stop mic' : 'Mic'}</button>

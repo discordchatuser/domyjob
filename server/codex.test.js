@@ -34,6 +34,9 @@ test('adapts streamed messages and interrupts before cleaning and deleting', asy
   assert.equal(seen[0].thread_id, 'thread-1');
   assert.match(rpc.calls[0].params.developerInstructions, /persistent main orchestrator/);
   assert.match(rpc.calls[0].params.developerInstructions, /spawn and manage subagents/);
+  assert.match(rpc.calls[0].params.developerInstructions, /project_tasks/);
+  assert.match(rpc.calls[0].params.developerInstructions, /current project's absolute path/);
+  assert.match(rpc.calls[0].params.developerInstructions, /\"\/workspace\"/);
   assert.equal(seen.find(event => event.type === 'item.updated').item.text, 'Hello');
   await client.deleteThread('thread-1');
   assert.deepEqual(rpc.calls.map(call => call.method), ['thread/start', 'turn/start', 'turn/interrupt', 'thread/backgroundTerminals/clean', 'thread/delete']);
@@ -168,4 +171,93 @@ test('records parent and observed child usage with project attribution', async (
   assert.equal(records[1].model, 'small');
   assert.equal(records[0].project, '/project');
   assert.equal(records[0].tokens.totalTokens, 50);
+});
+
+
+test('resumed orchestrators receive the current task capture skill and project scope', async () => {
+  const rpc = new FakeRpc();
+  const client = createClient(rpc, { routing: false });
+  const controller = new AbortController();
+  const { events } = await client.resume('thread-1', '/current-project').runStreamed('Create a task', { orchestrator: true, signal: controller.signal });
+  for await (const event of events) if (event.type === 'item.updated') controller.abort();
+  assert.equal(rpc.calls[0].method, 'thread/resume');
+  assert.match(rpc.calls[0].params.developerInstructions, /project_tasks/);
+  assert.match(rpc.calls[0].params.developerInstructions, /"\/current-project"/);
+  assert.match(rpc.calls[0].params.developerInstructions, /Creation schedules work/);
+});
+
+class RecoveryRpc extends FakeRpc {
+  turns = 0;
+  interrupted = new Set();
+  constructor(results) { super(); this.results = results; }
+  async request(method, params) {
+    if (method === 'turn/interrupt') {
+      this.calls.push({ method, params });
+      this.interrupted.add(params.turnId);
+      this.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: params.turnId, status: 'interrupted' } } });
+      return {};
+    }
+    if (method !== 'turn/start') return super.request(method, params);
+    this.calls.push({ method, params });
+    const id = 'turn-' + ++this.turns;
+    queueMicrotask(() => {
+      this.emit('notification', { method: 'turn/started', params: { threadId: 'thread-1', turn: { id } } });
+      const item = this.results[this.turns - 1] || { type: 'agentMessage', text: 'Verified outcome' };
+      this.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', item: { id: 'action-' + this.turns, ...item } } });
+      if (!this.interrupted.has(id)) this.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id, status: 'completed' } } });
+    });
+    return { turn: { id } };
+  }
+}
+const failedNpm = { type: 'commandExecution', command: 'npm uninstall smtp-server', exitCode: 1, aggregatedOutput: 'EPERM mkdtemp ~/.npm', status: 'completed' };
+
+test('pauses failures for JEV, checks the next successful action, then continues in the same thread', async () => {
+  const rpc = new RecoveryRpc([failedNpm, { ...failedNpm, command: 'npm --cache .npm-cache uninstall smtp-server', exitCode: 0, aggregatedOutput: 'Removed package' }]);
+  const inspections = [];
+  const client = createClient(rpc, { routing: false, inspectAction: async input => {
+    inspections.push(input);
+    assert.equal(rpc.calls.at(-1).method, 'turn/interrupt', 'turn is paused before JEV decides');
+    return { decision: inspections.length === 1 ? 'retry' : 'continue', source: 'jev', reason: 'Use writable cache' };
+  } });
+  const { events } = await client.start('/project').runStreamed('Remove SMTP and verify', { inputImages: ['data:image/png;base64,test'] });
+  const seen = []; for await (const event of events) seen.push(event);
+  assert.equal(inspections.length, 2);
+  assert.equal(inspections[0].action.exitCode, 1);
+  assert.equal(inspections[1].action.exitCode, 0);
+  assert.equal(inspections[1].history[0].decision.decision, 'retry');
+  assert.equal(seen.filter(event => event.type === 'recovery.decision').length, 2);
+  assert.equal(rpc.turns, 3);
+  assert.equal(rpc.calls.filter(call => call.method === 'thread/start').length, 1);
+  const turns = rpc.calls.filter(call => call.method === 'turn/start');
+  assert.match(turns[1].params.input[0].text, /JEV inspected/);
+  assert.equal(turns[0].params.input.length, 2);
+  assert.equal(turns[1].params.input.length, 1);
+  assert.equal(rpc.listenerCount('notification'), 0);
+});
+
+test('offline cache miss stops with JEV reason and never launches another action', async () => {
+  const rpc = new RecoveryRpc([{ ...failedNpm, aggregatedOutput: 'ENOTCACHED only-if-cached' }]);
+  const client = createClient(rpc, { routing: false, inspectAction: async () => ({ decision: 'stop', source: 'jev', reason: 'Dependencies are unavailable without network access.' }) });
+  const { events } = await client.start().runStreamed('Remove SMTP');
+  await assert.rejects(async () => { for await (const event of events) { /* consume */ } }, /Dependencies are unavailable/);
+  assert.equal(rpc.turns, 1);
+  assert.equal(rpc.listenerCount('notification'), 0);
+});
+
+test('bounded retries stop even if JEV keeps recommending another retry', async () => {
+  const rpc = new RecoveryRpc([failedNpm, failedNpm, failedNpm, failedNpm]);
+  const client = createClient(rpc, { routing: false, inspectAction: async () => ({ decision: 'retry', source: 'jev', reason: 'Try a fix' }) });
+  const { events } = await client.start().runStreamed('Remove SMTP');
+  await assert.rejects(async () => { for await (const event of events) { /* consume */ } }, /recovery limit/);
+  assert.equal(rpc.turns, 3);
+});
+
+test('cancelling while JEV checks prevents a recovery turn', async () => {
+  const rpc = new RecoveryRpc([failedNpm]);
+  const controller = new AbortController();
+  const client = createClient(rpc, { routing: false, inspectAction: async () => { controller.abort(); return { decision: 'retry', reason: 'Try again' }; } });
+  const { events } = await client.start().runStreamed('Remove SMTP', { signal: controller.signal });
+  for await (const event of events) { /* consume */ }
+  assert.equal(rpc.turns, 1);
+  assert.equal(rpc.listenerCount('notification'), 0);
 });

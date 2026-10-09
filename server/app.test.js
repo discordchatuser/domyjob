@@ -130,10 +130,11 @@ test('streams, persists, resumes and rejects overlapping turns', async () => {
     assert.equal(interactive.cwd, await realpath(dataDir));
     const interactiveResponse = await post(base + `/api/chats/${interactive.id}/messages`, { prompt: 'Build a todo app' });
     // Wait until the handler has consumed the question event and saved the thread id.
-    for (let i = 0; i < 20; i++) {
+    const questionDeadline = Date.now() + 3000;
+    while (Date.now() < questionDeadline) {
       const list = await (await fetch(base + '/api/chats')).json();
       if (list[0].pendingQuestions.length) break;
-      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setTimeout(resolve, 10));
     }
     const questionState = await (await fetch(base + '/api/chats')).json();
     assert.equal(questionState[0].model, 'gpt-6.1-sol');

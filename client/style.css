@@ -82,7 +82,7 @@ header { display: flex; align-items: center; justify-content: space-between; gap
 .chat-meta #title { flex-basis: 100%; }
 #model { padding: 5px 9px; border: 1px solid var(--success-line); border-radius: 20px; color: var(--mint); background: var(--success-bg); font-size: 10px; margin-left: auto; }
 #model.routing { color: var(--amber); background: var(--warning-bg); border-color: var(--warning-line); }
-#messages { flex: 1; min-height: 0; overflow: auto; scrollbar-gutter: stable; padding: 22px 18px; }
+#messages { flex: 1; min-height: 0; overflow: auto; scrollbar-gutter: auto; padding: 22px 18px; }
 .empty { min-height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; padding: 20px 0; }
 .empty-orb { width: 54px; height: 54px; border-radius: 20px; display: grid; place-items: center; background: var(--selection); color: var(--text); font-size: 34px; margin-bottom: 16px; transform: rotate(-8deg); }
 .empty h1 { font-size: 23px; font-weight: 800; letter-spacing: -.6px; line-height: 1.25; margin: 0 0 12px; }
@@ -237,7 +237,7 @@ textarea[readonly] { color: var(--muted); }
 .terminal-output { height: 100%; min-height: 230px; }
 .terminal-empty { position: absolute; top: 26px; left: 28px; color: var(--muted) !important; font-size: 13px; pointer-events: none; }
 .terminal-output .xterm { height: 100%; }
-.terminal-output .xterm-viewport { scrollbar-width: thin; }
+.terminal-output .xterm-viewport { scrollbar-width: none; }
 .folder-browser { width: min(600px,95vw); border: 1px solid var(--accent); border-radius: 22px; background: var(--panel); color: inherit; padding: 24px; box-shadow: 0 24px 80px #0008; }
 .folder-browser::backdrop, .gallery::backdrop { background: #080b10c9; }
 .folder-browser form { display: flex; gap: 8px; }
@@ -367,3 +367,119 @@ textarea[readonly] { color: var(--muted); }
 .usage-table table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .usage-table th, .usage-table td { text-align: left; padding: 14px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .usage-table small { display: block; opacity: .65; max-width: 360px; overflow-wrap: anywhere; margin-top: 6px; }
+
+.task-modal { width: min(680px, 94vw); max-height: 90dvh; overflow: auto; border: 1px solid var(--accent); border-radius: 18px; padding: 24px; color: var(--text); background: var(--panel); }
+.task-modal::backdrop { background: #080b10c9; }
+.task-modal .project-toolbar { justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.task-modal h2 { margin: 0; }
+.task-modal form { display: grid; gap: 16px; margin-top: 20px; }
+.task-modal label { display: grid; gap: 8px; }
+.task-modal input, .task-modal textarea, .task-modal select { width: 100%; box-sizing: border-box; }
+.task-modal textarea { resize: vertical; }
+.task-attachments { display: flex; gap: 12px; flex-wrap: wrap; }
+.task-attachments > div { display: grid; gap: 6px; max-width: 150px; }
+.task-attachments img { width: 120px; height: 90px; object-fit: contain; display: block; }
+.task-attachments span { display: block; overflow-wrap: anywhere; }
+.task-viewer { width: min(1000px, 94vw); }
+.task-viewer-text { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 160px; padding: 20px; margin: 16px 0; border: 1px solid var(--line); border-radius: 10px; user-select: text; }
+.task-viewer-text mark { background: #f6cf64; color: #171717; }
+.task-image-stage { position: relative; width: fit-content; max-width: 100%; margin: 16px auto; }
+.task-image-stage img { display: block; max-width: 100%; max-height: 60dvh; }
+.task-image-stage svg { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+.task-image-stage rect { fill: #f6cf6433; stroke: #f6cf64; stroke-width: .004; }
+.task-graph { margin: 24px 0; padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+.task-graph h2 { margin: 0; }
+.task-graph-scroll { overflow: auto; max-height: 580px; border-radius: 10px; }
+.task-graph svg { display: block; }
+.task-graph svg text { fill: var(--text); font: 13px system-ui; }
+.task-graph .graph-subtitle, .task-graph .graph-link-label { fill: var(--muted); font-size: 11px; }
+.graph-node { cursor: pointer; }
+.graph-node rect { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
+.graph-node.done rect { stroke: #68b68e; }
+.graph-node.blocked rect { stroke: #d8a55d; }
+.graph-node.progress rect { stroke: var(--accent); }
+.graph-node:focus { outline: none; }
+.graph-node:hover rect, .graph-node:focus rect { stroke: var(--accent); stroke-width: 3; }
+.graph-edge { fill: none; stroke: #718096; stroke-width: 1.5; }
+#task-graph-arrow path { fill: #718096; }
+.graph-details { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; }
+.graph-details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 380px; overflow: auto; }
+.graph-details details { margin-top: 14px; }
+.task-assessment { display: grid; gap: 8px; margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; }
+.task-assessment p { margin: 0; }
+
+/* Keep one working view visible, with task detail available on demand. */
+.focused-project-page .project-page-heading { margin-bottom: 22px; }
+.focused-project-page .project-page-heading h1 { font-size: 22px; margin: 0; }
+.focused-project-page .project-page-heading .project-toolbar { gap: 8px; }
+.primary-action { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.quiet-button { background: transparent; color: var(--muted); border-color: transparent; }
+.task-view-nav { display: flex; gap: 24px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.task-view-nav button { background: transparent; border: 0; border-radius: 0; color: var(--muted); padding: 0 0 12px; font-size: 13px; }
+.task-view-nav button[aria-current=page] { color: var(--text); box-shadow: 0 2px var(--accent); }
+.focused-project-page .board-filters { margin-bottom: 20px; }
+.focused-project-page .board-filters input { max-width: 340px; }
+.focused-project-page .task-card { gap: 8px; padding: 16px; }
+.focused-project-page .task-card strong { font-weight: 500; line-height: 1.5; }
+.focused-project-page .board-column h2 { font-size: 12px; font-weight: 500; }
+.focused-project-page .board-note { font-size: 12px; }
+.task-status-line { font-size: 12px; color: var(--muted); margin-top: 18px; }
+.task-description { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; margin: 18px 0 24px; }
+.task-main-actions { justify-content: flex-start !important; }
+.task-more { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--line); }
+.task-more summary, .graph-help summary, .scan-notes summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.task-more pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-attention { background: var(--raised); padding: 12px; border-radius: 10px; font-size: 13px; }
+.delete-task { margin-top: 20px; color: var(--muted); background: transparent; }
+.project-history h2 { font-size: 16px; margin: 20px 0; }
+.project-history ol { list-style: none; padding: 0; margin: 0; }
+.project-history li { display: flex; justify-content: space-between; gap: 20px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+.project-history li div { display: grid; gap: 5px; }
+.project-history strong { font-weight: 500; font-size: 13px; }
+.project-history span, .project-history time { color: var(--muted); font-size: 12px; }
+.project-history time { white-space: nowrap; }
+.execution-notice { display: flex; align-items: center; gap: 12px; font-size: 13px; }
+.focused-project-page .task-graph { margin: 0; padding: 0; border: 0; background: transparent; }
+.graph-help { margin: 12px 0 18px; }
+@media(max-width:760px) { .project-history li { flex-direction: column; gap: 8px; } .task-main-actions { flex-wrap: wrap; } .focused-project-page .project-page-heading { gap: 12px; } }
+.focused-project-page .board-column { border-top-width: 1px; background: transparent; border-color: var(--line); min-height: 230px; }
+.focused-project-page .task-card { box-shadow: none; background: var(--panel); cursor: grab; }
+.focused-project-page .task-card:active { cursor: grabbing; }
+.focused-project-page .task-card.dragging { opacity: .4; }
+.focused-project-page .board-column.drop-target { background: var(--selection); border-color: var(--accent); }
+.task-status-line { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.task-status-line label { display: flex; align-items: center; gap: 8px; }
+.task-status-line select { width: auto; font-size: 12px; padding: 6px 10px; }
+
+/* Native modal dialogs live in the top layer and center against the viewport. */
+dialog:is(.task-modal, .gallery, .folder-browser) {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+}
+/* Hide scrollbar chrome while preserving wheel, touch and keyboard scrolling. */
+*, *::before, *::after { scrollbar-width: none; scrollbar-gutter: auto; }
+*::-webkit-scrollbar { display: none; width: 0; height: 0; }
+.terminal-output .xterm .xterm-scrollable-element > .scrollbar { opacity: 0 !important; pointer-events: none; }
+
+/* One global header, with project navigation beside the working surface. */
+main.has-project { flex-direction: row; overflow: hidden; }
+.workspace-sidebar { flex: 0 0 168px; padding: 24px 12px; background: var(--surface); border-right: 1px solid var(--line); overflow: auto; }
+.sidebar-heading { padding: 0 12px 16px; color: var(--muted); font-size: 11px; letter-spacing: .06em; }
+.workspace-navigation { display: flex; flex-direction: column; gap: 6px; }
+.workspace-navigation button { display: flex; align-items: center; justify-content: space-between; width: 100%; text-align: left; border: 0; background: transparent; color: var(--muted); padding: 12px; font-size: 13px; border-radius: 10px; }
+.workspace-navigation button:hover { background: var(--hover); color: var(--text); }
+.workspace-navigation button[aria-selected=true] { background: var(--selection); color: var(--text); }
+.sidebar-running { color: var(--mint); }
+.has-project > .work-area { overflow: hidden; }
+@media(max-width:760px) {
+  .workspace-sidebar { flex-basis: 108px; padding: 20px 8px; }
+  .sidebar-heading { padding: 0 8px 14px; font-size: 10px; }
+  .workspace-navigation button { padding: 10px 8px; font-size: 12px; }
+  .has-project .project-surface { flex: 1; min-height: 0; overflow: hidden; }
+  .has-project .project-content-slot { min-height: 0; }
+  .has-project .chat-panel { min-height: 0; height: 100%; }
+}

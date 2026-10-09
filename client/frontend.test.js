@@ -50,7 +50,7 @@ test('React chat preserves choices and drafts, retries answers, streams replies,
   const { act } = React;
   const { App } = await import('data:text/javascript;base64,' + Buffer.from(compiled.outputFiles[0].text).toString('base64'));
   let chats = [
-    { id: 'one', title: 'First thread', messages: [], pendingQuestions: [request], images: [{ id: 'img1', url: '/first.png', prompt: 'First image' }, { id: 'img2', url: '/second.png' }] },
+    { id: 'one', title: 'First thread', messages: [{ role: 'user', text: 'Oldest request' }, { role: 'assistant', text: 'Assistant reply' }, { role: 'user', text: 'Question response', questionResponse: { requestId: 'answered', questions: [], answers: {} } }, { role: 'user', text: 'Latest request\nWith details' }], pendingQuestions: [request], images: [{ id: 'img1', url: '/first.png', prompt: 'First image' }, { id: 'img2', url: '/second.png' }] },
     { id: 'two', title: 'Second thread', messages: [], pendingQuestions: [], images: [] },
   ];
   let stream, rejectAnswer = true;
@@ -91,6 +91,34 @@ test('React chat preserves choices and drafts, retries answers, streams replies,
     assert.equal(document.querySelector('.app-shell').dataset.theme, 'sand');
     assert.equal(window.localStorage.getItem('color-scheme'), 'sand');
     assert.ok(document.querySelector('.composer-actions #send'));
+    const prompt = document.querySelector('#prompt');
+    const arrow = async (key, options = {}) => { const event = new window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options }); await act(async () => prompt.dispatchEvent(event)); return event; };
+    await type(prompt, 'Unsent draft');
+    assert.equal((await arrow('ArrowUp')).defaultPrevented, true);
+    assert.equal(prompt.value, 'Latest request\nWith details');
+    await arrow('ArrowUp'); assert.equal(prompt.value, 'Oldest request');
+    await arrow('ArrowUp'); assert.equal(prompt.value, 'Oldest request');
+    await arrow('ArrowDown'); assert.equal(prompt.value, 'Latest request\nWith details');
+    await arrow('ArrowDown'); assert.equal(prompt.value, 'Unsent draft');
+    assert.equal((await arrow('ArrowDown')).defaultPrevented, false);
+    await type(prompt, 'First line\nSecond line');
+    prompt.setSelectionRange(prompt.value.length, prompt.value.length);
+    assert.equal((await arrow('ArrowUp')).defaultPrevented, false, 'normal multiline cursor movement must remain available');
+    prompt.setSelectionRange(0, 0);
+    await arrow('ArrowUp'); assert.equal(prompt.value, 'Latest request\nWith details');
+    assert.equal((await arrow('ArrowUp', { shiftKey: true })).defaultPrevented, false);
+    await arrow('ArrowDown'); assert.equal(prompt.value, 'First line\nSecond line');
+    prompt.setSelectionRange(0, 0); await arrow('ArrowUp');
+    await click([...document.querySelectorAll('#threads button')].find(button => button.textContent === 'Second thread'));
+    await type(prompt, 'Other conversation draft');
+    await arrow('ArrowUp'); assert.equal(prompt.value, 'Other conversation draft');
+    await click([...document.querySelectorAll('#threads button')].find(button => button.textContent === 'First thread'));
+    await arrow('ArrowDown'); assert.equal(prompt.value, 'First line\nSecond line');
+    prompt.setSelectionRange(0, 0); await arrow('ArrowUp');
+    await type(prompt, 'Edited recalled message');
+    await arrow('ArrowDown'); assert.equal(prompt.value, 'Edited recalled message');
+    await type(prompt, '');
+
 
     await click(document.querySelector('input[value="Bold"]'));
     assert.ok(document.querySelector('.question-card'));
@@ -170,15 +198,18 @@ test('projects use one orchestrator, preserve drafts and leave thread controls t
     original.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   }
+  dom.window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  dom.window.HTMLDialogElement.prototype.close = function () { this.open = false; };
   window.localStorage.setItem('color-scheme', 'midnight');
   const previousFetch = globalThis.fetch;
   const chats = [{ id: 'a', title: 'Trophy design', cwd: '/work/TROPHY', messages: [] }, { id: 'b', title: 'Other task', cwd: '/work/OTHER', messages: [] }];
-  let createdCwd;
+  let createdCwd, taskStream;
   globalThis.fetch = async (url, options) => {
-    if (url === '/api/status') return Response.json({ ready: true, model: 'Test' });
-    if (url === '/api/chats' && options?.method === 'POST') { createdCwd = JSON.parse(options.body).cwd; return Response.json({ id: 'new', title: 'New thread', cwd: createdCwd, messages: [] }); }
+    if (url === '/api/status') return Response.json({ ready: true, model: 'Test', models: [{ model: 'test-model', displayName: 'Test' }] });
+    if (url === '/api/chats' && options?.method === 'POST') { createdCwd = JSON.parse(options.body).cwd; return Response.json({ ...chats[0], orchestrator: true }); }
+    if (url === '/api/chats/a/messages') return new Response(new ReadableStream({ start(controller) { taskStream = controller; } }));
     if (url === '/api/chats') return Response.json(chats);
-    if (url.includes('/project/content')) return Response.json({ documents: [], tasks: [], warnings: [] });
+    if (url.includes('/project/content')) return Response.json({ documents: [], tasks: [{ id: 'clarify', title: 'Replace Email', description: 'Show contact cards', status: 'todo', phase: 'Project', docs: [], assessment: { needsClarification: true } }], warnings: [] });
     throw new Error('Unexpected request ' + url);
   };
   const React = await import('react');
@@ -192,6 +223,10 @@ test('projects use one orchestrator, preserve drafts and leave thread controls t
     assert.equal(document.querySelector('#threads'), null);
     assert.equal(document.querySelector('#new'), null);
     assert.equal(document.querySelector('#title').textContent, 'Project orchestrator');
+    assert.equal(document.querySelector('.workspace-header'), null);
+    assert.ok(document.querySelector('.workspace-sidebar [aria-label="Project views"]'));
+    assert.equal(document.querySelector('[aria-label="Project views"]').getAttribute('aria-orientation'), 'vertical');
+    assert.equal(document.querySelector('[aria-label="Task model"]'), null);
     const prompt = document.querySelector('#prompt');
     await React.act(async () => { Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set.call(prompt, 'Keep draft'); prompt.dispatchEvent(new dom.window.Event('input', { bubbles: true })); });
     const projectTab = name => [...document.querySelectorAll('[aria-label="Projects"] button')].find(node => node.textContent.includes(name));
@@ -202,7 +237,7 @@ test('projects use one orchestrator, preserve drafts and leave thread controls t
     assert.equal(document.querySelector('#prompt').value, 'Keep draft');
     await click([...document.querySelectorAll('[aria-label="Project views"] button')].find(node => node.textContent === 'Documents'));
     assert.equal(document.querySelector('.document-workspace').hidden, false);
-    assert.equal(document.querySelector('.task-board').hidden, true);
+    assert.equal(document.querySelector('.task-board'), null);
     assert.equal(document.querySelector('.chat-panel').hidden, true);
     const chatTab = [...document.querySelectorAll('[aria-label="Project views"] button')].find(node => node.textContent === 'Chat');
     await click(chatTab);
@@ -215,8 +250,23 @@ test('projects use one orchestrator, preserve drafts and leave thread controls t
     await click(projectTab('General'));
     assert.ok(document.querySelector('#new'));
     assert.ok(document.querySelector('#threads'));
+    assert.ok(document.querySelector('[aria-label="Task model"]'));
     await click(projectTab('TROPHY'));
     assert.equal(document.querySelector('#prompt').value, 'Keep draft');
+    await click([...document.querySelectorAll('[aria-label="Project views"] button')].find(node => node.textContent === 'Tasks'));
+    await click(document.querySelector('.task-card'));
+    const run = [...document.querySelectorAll('dialog button')].find(node => node.textContent === 'Run task');
+    assert.equal(run.disabled, false, 'tasks needing clarification can start');
+    await click(run);
+    assert.equal(document.querySelector('.chat-panel').hidden, false);
+    assert.equal(document.querySelector('dialog'), null);
+    const emit = async event => React.act(async () => { taskStream.enqueue(new TextEncoder().encode(JSON.stringify(event) + '\n')); });
+    await emit({ type: 'chat', chat: { ...chats[0], orchestrator: true, busy: true, pendingQuestions: [] } });
+    await emit({ type: 'questions', request });
+    assert.ok(document.querySelector('form.question-card'), 'task clarification appears in the orchestrator chat');
+    assert.equal(document.querySelector('#prompt').value, 'Keep draft');
+    await emit({ type: 'done', chat: { ...chats[0], orchestrator: true, busy: false, pendingQuestions: [] } });
+    await React.act(async () => taskStream.close());
   } finally {
     await React.act(async () => root.unmount()); globalThis.fetch = previousFetch; dom.window.close();
     for (const [key, descriptor] of original) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; }

@@ -3,11 +3,30 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
 
+// These app-owned tools are already authorized by the task and routing workflows.
+// Keep approval overrides tool-specific; leave other MCP servers and shell policy alone.
+export const appToolApprovals = {
+  project_tasks: ['list_tasks', 'create_task', 'update_task'],
+  jev_router: ['choose_model'],
+};
+export function appServerArgs() {
+  const servers = {
+    jev_router: [fileURLToPath(new URL('./jev-mcp.js', import.meta.url)), fileURLToPath(new URL('../.data/model-catalog.json', import.meta.url))],
+    project_tasks: [fileURLToPath(new URL('./tasks-mcp.js', import.meta.url))],
+  };
+  return ['app-server', '--enable', 'multi_agent', ...Object.entries(servers).flatMap(([server, args]) => [
+    '-c', `mcp_servers.${server}.command=${JSON.stringify(process.execPath)}`,
+    '-c', `mcp_servers.${server}.args=${JSON.stringify(args)}`,
+    '-c', `mcp_servers.${server}.enabled_tools=${JSON.stringify(appToolApprovals[server])}`,
+    ...appToolApprovals[server].flatMap(tool => ['-c', `mcp_servers.${server}.tools.${tool}.approval_mode="approve"`]),
+  ]), '--listen', 'stdio://'];
+}
+
 export class CodexRpc extends EventEmitter {
   constructor(binary) {
     super();
     this.pending = new Map(); this.nextId = 1; this.failure = null;
-    this.child = spawn(binary, ['app-server', '--enable', 'multi_agent', '-c', 'mcp_servers.jev_router.command=' + JSON.stringify(process.execPath), '-c', 'mcp_servers.jev_router.args=' + JSON.stringify([fileURLToPath(new URL('./jev-mcp.js', import.meta.url)), fileURLToPath(new URL('../.data/model-catalog.json', import.meta.url))]), '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.child = spawn(binary, appServerArgs(), { stdio: ['pipe', 'pipe', 'pipe'] });
     let stderr = '';
     this.child.stderr.on('data', data => { stderr = (stderr + data).slice(-4000); });
     this.lines = createInterface({ input: this.child.stdout });

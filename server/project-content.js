@@ -76,5 +76,8 @@ export async function projectContent(root) {
   }
   await walk(project.cwd);
   documents.sort((a, b) => a.path.localeCompare(b.path));
-  return { ...project, documents, tasks: parseTasks(documents, texts), warnings };
+  const trophy = documents.filter(doc => /trophy/i.test(doc.path) && /summary/i.test(doc.path));
+  const relevant = trophy.length ? trophy : documents.filter(doc => !doc.path.startsWith('.') && !/(?:^|\/)(?:skills|server|client|scripts|tests?)\//i.test(doc.path));
+  const requirements = documents.filter(doc => /(?:^|[\/_-])PRD(?:[\/_.-]|$)|requirements/i.test(doc.path) && doc.type === 'md').map(doc => ({ path: doc.path, text: (texts.get(doc.path) || '').slice(0, 40000) }));
+  return { ...project, requirements, productContext: relevant.filter(doc => /summary|project/i.test(doc.path) && doc.type === 'md').slice(0, 2).map(doc => ({ path: doc.path, text: (texts.get(doc.path) || '').slice(0, 20000) })), documents: [...new Map([...relevant, ...documents.filter(doc => requirements.some(item => item.path === doc.path))].map(doc => [doc.path, doc])).values()], tasks: parseTasks(documents, texts), warnings };
 }

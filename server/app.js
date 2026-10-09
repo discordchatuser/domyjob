@@ -1,3 +1,6 @@
+import { assessTask } from './task-assessment.js';
+import { syncTaskPrd } from './task-prd.js';
+import { taskStore } from './project-tasks.js';
 import { usageStore, openRouterAccount } from './usage.js';
 import { migrateProjectChats, projectOrchestrator } from './project-chats.js';
 import { projectContent, readDocument } from './project-content.js';
@@ -8,10 +11,23 @@ import { readFile, mkdir, rename, writeFile, stat, realpath } from 'node:fs/prom
 import { imageStore, imageReferences } from './images.js';
 import { resolve, extname } from 'node:path';
 
-export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' }) {
+export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist', selectTaskModel }) {
   await mkdir(dataDir, { recursive: true });
   const images = imageStore(dataDir);
+  const tasks = await taskStore(dataDir);
   const usage = usageStore(dataDir);
+  async function evaluate(content, task) {
+    const existing = tasks.merged(content.cwd, content.tasks);
+    const assessment = await assessTask({ task, content, existing, getCodex, reportUsage: usage.record, ...(selectTaskModel ? { select: selectTaskModel } : {}) });
+    const next = await tasks.assess(content.cwd, task, { ...assessment, ...(task.assessment?.prdPath ? { prdPath: task.assessment.prdPath } : {}) });
+    if (!next || next.deleted || next.revision !== task.revision) return next;
+    try {
+      const prdPath = await syncTaskPrd(content.cwd, next.assessment.prdPath || content.requirements[0]?.path, tasks.merged(content.cwd, content.tasks));
+      return await tasks.assess(content.cwd, next, { ...next.assessment, prdPath, prdSync: 'synced' });
+    } catch {
+      return tasks.assess(content.cwd, next, { ...next.assessment, prdSync: 'failed', warning: 'Task saved, but the PRD change record could not be written. Re-evaluate to retry.' });
+    }
+  }
   let accountCache;
   let accountAt = 0;
   const file = resolve(dataDir, 'chats.json');
@@ -22,9 +38,9 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
   const running = new Map();
   const deleting = new Set();
   const questions = new Map();
-  async function readJson(req) {
+  async function readJson(req, limit = 65536) {
     let body = '';
-    for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 65536) throw new Error('Request is too large'); }
+    for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > limit) throw new Error('Request is too large'); }
     return body ? JSON.parse(body) : {};
   }
   let saves = Promise.resolve();
@@ -58,10 +74,29 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
       if (req.method === 'GET' && ['/api/project/content', '/api/project/document'].includes(pathname)) {
         try {
           const params = new URL(req.url, 'http://localhost').searchParams;
-          if (pathname.endsWith('/content')) return json(200, await projectContent(params.get('path')));
+          if (pathname.endsWith('/content')) { const content = await projectContent(params.get('path')); return json(200, { ...content, tasks: tasks.merged(content.cwd, content.tasks), audit: tasks.audit(content.cwd) }); }
           const document = await readDocument(params.get('path'), params.get('file'));
           res.writeHead(200, { 'Content-Type': document.type, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
           res.end(document.bytes); return;
+        } catch (error) { return json(400, { error: error.message }); }
+      }
+      if (pathname === '/api/project/tasks/assess' && req.method === 'POST') {
+        try { const input = await readJson(req); const content = await projectContent(input.cwd); const task = tasks.merged(content.cwd, content.tasks).find(item => item.id === input.id); if (!task) throw new Error('Task not found'); if (task.execution?.status === 'running') throw new Error('Task is running'); return json(200, await evaluate(content, task)); } catch (error) { return json(400, { error: error.message }); }
+      }
+      if (pathname === '/api/project/tasks' && ['POST', 'PATCH', 'DELETE'].includes(req.method)) {
+        try {
+          const input = await readJson(req, 12 * 1024 * 1024);
+          const content = await projectContent(input.cwd);
+          const changes = Object.fromEntries(['title', 'description', 'status', 'images', 'highlights'].filter(key => input[key] !== undefined).map(key => [key, input[key]]));
+          if (req.method !== 'POST' && typeof input.id !== 'string') throw new Error('Select a task');
+          const task = await tasks.update(content.cwd, content.tasks, req.method === 'POST' ? null : input.id, changes, req.method === 'DELETE');
+          if (req.method === 'DELETE') {
+            if (task.assessment?.prdPath) { try { await syncTaskPrd(content.cwd, task.assessment.prdPath, tasks.merged(content.cwd, content.tasks)); } catch { await tasks.record(content.cwd, 'prd.sync_failed', task); } }
+            return json(200, task);
+          }
+          if (req.method === 'POST' || (task.assessment?.status === 'pending' && ['title', 'description', 'images'].some(key => key in changes))) return json(200, await evaluate(content, task));
+          if (task.assessment?.prdPath) { try { await syncTaskPrd(content.cwd, task.assessment.prdPath, tasks.merged(content.cwd, content.tasks)); } catch { await tasks.record(content.cwd, 'prd.sync_failed', task); } }
+          return json(200, task);
         } catch (error) { return json(400, { error: error.message }); }
       }
       if (pathname === '/api/project' && req.method === 'GET') {
@@ -168,9 +203,24 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           if (typeof input.prompt !== 'string' || (input.commands !== undefined && (!Array.isArray(input.commands) || input.commands.length > 10 || input.commands.some(command => typeof command !== 'string' || !command.trim())))) return json(400, { error: 'Invalid prompt or commands' });
           const commands = (input.commands || []).map(command => command.trim());
           if (!input.prompt.trim() && !commands.length) return json(400, { error: 'Enter a prompt or command' });
+          let executionTask;
+          if (input.taskId !== undefined) {
+            if (!chat.cwd || !chat.orchestrator) return json(400, { error: 'Tasks must run in the project orchestrator' });
+            const content = await projectContent(chat.cwd);
+            executionTask = tasks.merged(chat.cwd, content.tasks).find(task => task.id === input.taskId);
+            if (!executionTask) return json(404, { error: 'Task not found' });
+            if (executionTask.execution?.status === 'running') return json(409, { error: 'Task is running' });
+            if (executionTask.assessment?.status === 'pending' || !executionTask.assessment) executionTask = await evaluate(content, executionTask);
+
+            input.prompt = `Execute this project task and verify the outcome.\nTitle: ${executionTask.title}\nDescription: ${executionTask.description || ''}\nSource documents: ${executionTask.docs.join(', ')}\nHighlighted text: ${JSON.stringify((executionTask.highlights || []).map(mark => executionTask.description.slice(mark.start, mark.end)))}\nImage annotations (coordinates normalized from 0 to 1): ${JSON.stringify((executionTask.images || []).map(image => ({ name: image.name, marks: image.marks || [] })))}`;
+            if (executionTask.assessment?.needsClarification) input.prompt += '\nCLARIFICATION REQUIRED: Before making any changes, inspect the task and relevant project context, then use ask_user to resolve missing or conflicting product details. Wait for the answers before implementing or changing requirements. Do not guess a replacement. If context already resolves the flagged ambiguity, explain that evidence before proceeding.';
+            input.prompt += '\nPRD impact assessment: ' + JSON.stringify(executionTask.assessment) + '\nRead the PRD and affected existing tasks before implementation. Apply the requested addition, removal, update or replacement to the actual requirement text, not just the task change register. Preserve unrelated requirements. Update affected task plans and descriptions on disk and the project summary so they reflect the new desired behavior. If the replacement or requirements remain ambiguous, ask the user before implementing. Verify behavior and report exact changed files, checks, and remaining work in the final response. Do not claim success unless verified.';
+            input.model = undefined;
+          }
           const codexPrompt = commands.length
             ? 'Run these shell commands in the working directory and report their output and exit status. For a long-running server, report startup output and return rather than waiting indefinitely.\n' + commands.map(command => JSON.stringify(command)).join('\n') + (input.prompt.trim() ? '\n\nUser request:\n' + input.prompt.trim() : '')
             : input.prompt.trim();
+          if (chat.orchestrator) input.model = undefined;
           if (input.model !== undefined && typeof input.model !== 'string') return json(400, { error: 'Invalid model' });
           const codex = await getCodex();
           if (input.model && codex.getModels && !(await codex.getModels()).some(item => item.model === input.model)) return json(400, { error: 'Model is not in the startup catalog' });
@@ -179,6 +229,7 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           chat.messages.push({ role: 'user', text: input.prompt.trim(), ...(commands.length ? { commands } : {}) });
           if (chat.title === 'New thread') chat.title = (input.prompt.trim() || commands[0]).slice(0, 48);
           await save();
+          if (executionTask) executionTask = await tasks.execution(chat.cwd, executionTask, 'running', { chatId: chat.id, startedAt: new Date().toISOString() });
           res.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-cache' });
           const send = event => { if (!res.destroyed) res.write(JSON.stringify(event) + '\n'); };
           controller.send = send;
@@ -186,13 +237,24 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
           if (controller.signal.aborted) { res.end(); return; }
           send({ type: 'chat', chat: summary(chat) });
           try {
-            const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal, orchestrator: Boolean(chat.orchestrator), context, requestedModel: input.model || undefined, usageProject: chat.cwd || '' });
+            const { events } = await thread.runStreamed(codexPrompt, { signal: controller.signal, orchestrator: Boolean(chat.orchestrator), context, requestedModel: input.model || undefined, usageProject: chat.cwd || '', inputImages: (executionTask?.images || []).map(image => image.data), preparedRoute: executionTask?.assessment?.status === 'evaluated' ? executionTask.assessment.route : undefined });
             for await (const event of events) {
+              if (event.type === 'recovery.checking' || event.type === 'recovery.decision') {
+                const checking = event.type === 'recovery.checking';
+                const item = { id: 'recovery-' + event.action.id, type: 'activity', label: checking ? 'JEV checking action result' : 'JEV: ' + event.decision.decision, output: checking ? event.action.action : event.decision.reason + '\nAction: ' + event.action.action + '\nExit status: ' + (event.action.exitCode ?? event.action.status), status: checking ? 'in_progress' : event.decision.decision === 'stop' ? 'failed' : 'completed' };
+                send({ type: 'activity', item });
+                if (!checking) {
+                  chat.messages.push({ ...item, role: 'activity' });
+                  if (executionTask) await tasks.record(chat.cwd, 'execution.recovery_decision', executionTask, { actionResult: event.action, decision: event.decision });
+                  await save();
+                }
+              }
               if (event.type === 'model.routing') {
                 chat.routing = true; send(event);
               }
               if (event.type === 'model.changed') {
                 const previousModel = chat.model || null;
+                if (executionTask) await tasks.record(chat.cwd, 'execution.model_selected', executionTask, { route: event.route });
                 chat.model = event.route.model; chat.modelRoute = event.route; chat.routing = false;
                 const message = { role: 'model', modelRoute: { ...event.route, previousModel } };
                 chat.messages.push(message);
@@ -233,10 +295,13 @@ export async function createApp({ getCodex, dataDir = '.data', distDir = 'dist' 
               if (event.type === 'turn.failed') throw new Error(event.error.message);
               if (event.type === 'error') throw new Error(event.message);
             }
+            if (executionTask) { executionTask = await tasks.execution(chat.cwd, executionTask, controller.signal.aborted ? 'cancelled' : 'completed', { route: chat.modelRoute, outcome: chat.messages.filter(item => item.role === 'assistant').at(-1)?.text?.slice(-20000) || '' }); }
           } catch (error) {
+            if (executionTask) await tasks.execution(chat.cwd, executionTask, controller.signal.aborted ? 'cancelled' : 'failed', { error: error.message, route: chat.modelRoute });
             chat.messages.push({ role: 'error', text: error.message });
             send({ type: 'error', error: error.message });
           }
+          if (executionTask?.assessment?.prdPath) { try { await syncTaskPrd(chat.cwd, executionTask.assessment.prdPath, tasks.merged(chat.cwd, (await projectContent(chat.cwd)).tasks)); } catch { await tasks.record(chat.cwd, 'prd.sync_failed', executionTask); } }
           chat.routing = false;
           questions.delete(chat.id);
           await save(); running.delete(chat.id);

@@ -56,3 +56,24 @@ test('subagent model tool works over MCP without exposing secrets', async () => 
   assert.ok(!JSON.stringify(invalid).includes('test-secret'));
   assert.equal(await handleMcp({ method: 'notifications/initialized' }), null);
 });
+
+test('one JEV call selects model, PRD impact, clarification and bounded task relationships', async () => {
+  let count = 0, request;
+  const route = await selectWithJev({ ...base, projectState: { requirements: [{ path: 'PRD.md', text: 'Offer an Email option' }], tasks: [{ id: 'email', title: 'Add Email option' }], totalTasks: 1 }, fetchImpl: async (_, options) => {
+    count++; request = JSON.parse(options.body);
+    return Response.json({ ...answer, answers: { ...answer.answers, prd_impact: { type: 'choice', choice: 'replace', confidence: .9 }, clarification: { type: 'choice', choice: 'required', confidence: .9 }, relationship_0: { type: 'choice', choice: 'supersedes', confidence: .95 } } });
+  } });
+  assert.equal(count, 1);
+  assert.deepEqual(Object.keys(request.questions), ['model', 'difficulty', 'prd_impact', 'clarification', 'relationship_0']);
+  assert.equal(request.state.product_requirements[0].path, 'PRD.md');
+  assert.equal(route.assessment.impact, 'replace');
+  assert.equal(route.assessment.needsClarification, true);
+  assert.deepEqual(route.assessment.relationships, [{ taskId: 'email', type: 'supersedes', confidence: .95 }]);
+  assert.equal(route.model, 'new-deep');
+});
+
+test('invalid impact choices fail visibly instead of recording fabricated PRD changes', async () => {
+  const route = await selectWithJev({ ...base, projectState: { requirements: [], tasks: [] }, fetchImpl: async () => Response.json({ ...answer, answers: { ...answer.answers, prd_impact: { type: 'choice', choice: 'invented', confidence: .9 } } }) });
+  assert.equal(route.source, 'fallback');
+  assert.equal(route.assessment, undefined);
+});

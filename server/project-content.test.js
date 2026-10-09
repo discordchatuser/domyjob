@@ -19,7 +19,7 @@ test('indexes planning docs and PDF, honors incomplete checkpoint evidence over 
     await writeFile(join(root, 'docs/mail.md'), '# Mail\n\n- [x] Local\n');
     await writeFile(join(root, 'spec.pdf'), '%PDF-1.4\n');
     const content = await projectContent(root);
-    assert.equal(content.documents.length, 5);
+    assert.equal(content.documents.length, 2);
     assert.deepEqual(content.tasks.map(task => task.status), ['done', 'blocked', 'todo']);
     assert.ok(content.tasks[0].docs.includes('docs/mail.md'));
     assert.match(content.tasks[2].title, /Phase 2/);
@@ -44,4 +44,15 @@ test('document reader rejects traversal, symlink escapes and other file types', 
     await assert.rejects(readDocument(root, '.env'), /Markdown or PDF/);
     assert.equal((await projectContent(root)).documents.length, 0);
   } finally { await rm(parent, { recursive: true, force: true }); }
+});
+
+
+test('TROPHY summary takes priority over internal project documents', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'trophy-docs-'));
+  try {
+    await writeFile(join(root, 'TROPHY-SUMMARY.md'), '# Project summary');
+    await writeFile(join(root, 'README.md'), '# Developer setup');
+    const content = await projectContent(root);
+    assert.deepEqual(content.documents.map(doc => doc.path), ['TROPHY-SUMMARY.md']);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
